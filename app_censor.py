@@ -15,19 +15,28 @@ st.title("🛡️ AI Auto Censor — Nama Akun Sahaja")
 st.markdown("""
 Aplikasi ini menggunakan **Gemini AI Vision** untuk membaca teks pada tangkapan layar, 
 mengidentifikasi nama pengguna yang dicetak **tebal (bold)** pada komentar, 
-dan menyensornya secara otomatis dengan kotak hitam solid.
+dan menyensornya secara otomatis.
 """)
 
 # Input API Key di Sidebar
 with st.sidebar:
-    st.header("⚙️ Pengaturan AI")
+    st.header("⚙️ Pengaturan AI & Sensor")
     default_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
     api_key = st.text_input("Masukkan Gemini API Key Anda:", type="password", value=default_key)
     st.markdown("[Dapatkan API Key Gratis di sini](https://aistudio.google.com/)")
     
-    pad_ukuran = st.slider("Lebar Ekstra Sensor (Padding px):", min_value=0, max_value=20, value=2, step=1)
     st.divider()
-    st.info("✅ Menggunakan model Gemini 1.5 Flash untuk performa vision terbaik.")
+    st.subheader("🛠️ Penyesuaian Posisi")
+    st.caption("Gunakan jika AI meleset dari nama (terlalu ke atas/bawah).")
+    
+    # Kunci perbaikan ada di sini: Fitur Offset untuk menggeser kotak secara manual
+    offset_y = st.slider("Geser Vertikal (Y):", min_value=-50, max_value=50, value=-20, step=1, 
+                         help="Geser ke kiri (minus) untuk menaikkan kotak. Geser ke kanan (plus) untuk menurunkan.")
+    
+    pad_ukuran = st.slider("Lebar Ekstra (Padding px):", min_value=0, max_value=20, value=2, step=1)
+    
+    st.divider()
+    st.info("✅ Menggunakan model Gemini 1.5 Flash.")
 
 # ==========================================
 # 2. FUNGSI INTI (DETEKSI & SENSOR)
@@ -37,11 +46,9 @@ def get_gemini_response(image_pil, prompt, api_key):
     """Mengirim gambar ke Gemini dengan deteksi model dinamis."""
     genai.configure(api_key=api_key)
     
-    # 1. Cek model apa saja yang aktif dan tersedia
     available_models = [m.name for m in genai.list_models() if "generateContent" in m.supported_generation_methods]
     
-    # 2. Cari model yang ada kata "flash"
-    chosen_model = "gemini-1.5-flash-latest" # Fallback default
+    chosen_model = "gemini-1.5-flash-latest" 
     for m_name in available_models:
         if "flash" in m_name:
             chosen_model = m_name.replace("models/", "")
@@ -49,20 +56,18 @@ def get_gemini_response(image_pil, prompt, api_key):
             
     model = genai.GenerativeModel(chosen_model)
     
-    # Konversi PIL ke bytes
     img_byte_arr = io.BytesIO()
     image_pil.save(img_byte_arr, format='PNG')
     img_bytes = img_byte_arr.getvalue()
     
-    # Kirim ke model
     response = model.generate_content([
         prompt, 
         {'mime_type': 'image/png', 'data': img_bytes}
     ])
     return response.text
 
-def apply_censor_to_coordinates(image_pil, boxes, pad_ukuran):
-    """Menerapkan Blok Hitam pada area koordinat yang diberikan."""
+def apply_censor_to_coordinates(image_pil, boxes, pad_ukuran, offset_y):
+    """Menerapkan Blok Hitam dengan kemampuan pergeseran vertikal (Offset Y)."""
     width, height = image_pil.size
     censored_image = image_pil.copy()
     draw = PIL.ImageDraw.Draw(censored_image)
@@ -71,50 +76,48 @@ def apply_censor_to_coordinates(image_pil, boxes, pad_ukuran):
         if len(box) == 4:
             ymin, xmin, ymax, xmax = box
             
-            # CEK SKALA KOORDINAT:
-            # Jika semua nilai berupa angka <= 1.0, berarti skalanya pecahan desimal (0.0 - 1.0)
+            # Cek skala desimal vs skala 1000 vs piksel asli
             if all(v <= 1.0 for v in box):
                 left = xmin * width
                 right = xmax * width
                 top = ymin * height
                 bottom = ymax * height
-            
-            # Jika nilainya di atas 1.0 tapi di bawah 1000, berarti skala 0-1000
             elif all(v <= 1000 for v in box):
                 left = (xmin / 1000) * width
                 right = (xmax / 1000) * width
                 top = (ymin / 1000) * height
                 bottom = (ymax / 1000) * height
-                
-            # Jika nilainya sangat besar, berarti sudah dalam bentuk piksel asli
             else:
                 left, right = xmin, xmax
                 top, bottom = ymin, ymax
 
-            # PENGAMAN: Urutkan agar koordinat kiri/kanan atau atas/bawah tidak terbalik
             x1, x2 = sorted([left, right])
             y1, y2 = sorted([top, bottom])
             
-            # Gambar Kotak Hitam Solid dengan ekstra padding
-            draw.rectangle([x1 - pad_ukuran, y1 - pad_ukuran, x2 + pad_ukuran, y2 + pad_ukuran], fill="black")
+            # Terapkan Offset Y untuk mengoreksi letak kotak (naik/turun)
+            y1_adjusted = y1 + offset_y
+            y2_adjusted = y2 + offset_y
+            
+            draw.rectangle([x1 - pad_ukuran, y1_adjusted - pad_ukuran, x2 + pad_ukuran, y2_adjusted + pad_ukuran], fill="black")
             
     return censored_image
 
 # ==========================================
 # 3. PROMPT KHUSUS UNTUK GEMINI
 # ==========================================
+# Prompt dipertajam untuk memastikan AI mengambil baris paling atas saja.
 AIM_PROMPT = """
 Analisis gambar tangkapan layar komentar media sosial ini.
-Identifikasi setiap nama pengguna (username/account name) yang dicetak TEBAL (BOLD) pada bagian komentar.
-Jangan identifikasi teks komentar biasa, jangan identifikasi timestamp. Hanya nama yang ditebalkan.
+Fokus HANYA pada NAMA PENGGUNA (username/account name) yang posisinya selalu ada di baris pertama dan dicetak TEBAL (BOLD).
+Jangan mengambil bounding box untuk isi teks komentar biasa di bawah nama tersebut.
+Bounding box [ymin, xmin, ymax, xmax] HARUS ketat dan pas mengelilingi nama tersebut, jangan sampai meluber ke baris bawahnya.
 
-Kembalikan hasilnya dalam format JSON murni, tanpa teks penjelasan lain di luar JSON.
-JSON harus berupa array dari objek. Setiap objek memiliki kunci 'nama' (teks nama) dan kunci 'kotak' (array koordinat yang dinormalisasi [ymin, xmin, ymax, xmax]).
+Kembalikan hasilnya dalam format JSON murni, tanpa teks penjelasan.
+JSON harus berupa array dari objek. Setiap objek memiliki kunci 'nama' dan kunci 'kotak' (array koordinat dinormalisasi [ymin, xmin, ymax, xmax]).
 
-Contoh Output:
+Contoh:
 [
-  {"nama": "UserA", "kotak": [0.120, 0.050, 0.150, 0.200]},
-  {"nama": "UserB", "kotak": [0.300, 0.050, 0.330, 0.220]}
+  {"nama": "UserA", "kotak": [0.120, 0.050, 0.135, 0.200]}
 ]
 """
 
@@ -159,8 +162,8 @@ if uploaded_files:
                 # 4. Ekstrak koordinat
                 coordinates = [item['kotak'] for item in name_data if 'kotak' in item]
                 
-                # 5. Terapkan Sensor Kotak Hitam
-                censored_image = apply_censor_to_coordinates(image, coordinates, pad_ukuran)
+                # 5. Terapkan Sensor dengan Offset
+                censored_image = apply_censor_to_coordinates(image, coordinates, pad_ukuran, offset_y)
                 
                 # 6. Tampilkan Hasil
                 with st.container(border=True):
@@ -168,7 +171,6 @@ if uploaded_files:
                     col1.image(image, caption=f"Asli: {filename}", use_container_width=True)
                     col2.image(censored_image, caption=f"Disensor: {len(coordinates)} Nama", use_container_width=True)
                     
-                    # Debugger: Lihat hasil JSON AI
                     with st.expander("🛠️ Lihat Data JSON (Koordinat AI)"):
                         st.json(name_data)
                 
@@ -192,7 +194,7 @@ if uploaded_files:
             mime="application/zip",
             use_container_width=True
         )
-        st.success("✅ Semua gambar selesai diproses.")
+        st.success("✅ Semua gambar selesai diproses. Jika kotak meleset, atur slider 'Geser Vertikal' di sidebar lalu proses ulang!")
 
 elif not uploaded_files:
     st.info("👆 Silakan unggah satu atau beberapa gambar untuk memulai.")
