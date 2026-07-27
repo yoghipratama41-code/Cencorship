@@ -1,381 +1,185 @@
 import streamlit as st
+import PIL.Image
+import PIL.ImageDraw
+import PIL.Imagefilter
+import json
 import io
 import zipfile
-import math
+import time
+from google.generativeai import GenerativeModel
+import google.generativeai as genai
 
-import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
-import cv2
+# ==========================================
+# 1. KONFIGURASI SISTEM & AI
+# ==========================================
+st.set_page_config(page_title="AI Name Censor", page_icon="🛡️", layout="wide")
 
-# ============== CONFIG ==============
-st.set_page_config(page_title="Auto Censor — Names Only (Text Detect)", page_icon="🛡️", layout="wide")
+st.title("🛡️ AI Auto Censor — Nama Akun Sahaja")
+st.markdown("""
+Aplikasi ini menggunakan **Gemini AI Vision** untuk membaca teks pada tangkapan layar, 
+mengidentifikasi nama pengguna yang dicetak **tebal (bold)** pada komentar, 
+dan menyensornya secara otomatis. *Profile picture* tetap utuh.
+""")
 
-
-# ============== NAME DETECTION (OpenCV Text Lines) ==============
-def detect_names(image, cfg):
-    """
-    Detect name text regions using morphological line detection.
-    Names = short horizontal text lines at the top of each comment row,
-    positioned to the right of the avatar margin.
-    """
-    img_array = np.array(image.convert("RGB"))
-    h, w = img_array.shape[:2]
-
-    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-
-    # Adaptive threshold: text becomes white on black
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    # Morphological closing with wide horizontal kernel → connects letters into lines
-    kernel_w = max(10, int(w * cfg["kernel_ratio"]))
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, cfg["kernel_h"]))
-    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-
-    # Optional: dilate vertically a bit to catch bold names
-    if cfg["dilate_v"] > 0:
-        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, cfg["dilate_v"]))
-        closed = cv2.dilate(closed, v_kernel, iterations=1)
-
-    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    candidates = []
-    for cnt in contours:
-        x, y, bw, bh = cv2.boundingRect(cnt)
-
-        # Position: must be to the right of avatar space
-        if x < cfg["min_x"]:
-            continue
-        if x > w * cfg["max_x_ratio"]:
-            continue
-
-        # Size filters
-        if bh < cfg["min_h"] or bh > cfg["max_h"]:
-            continue
-        if bw < cfg["min_w"] or bw > cfg["max_w"]:
-            continue
-
-        # Aspect ratio: names are wide and short
-        aspect = bw / bh if bh > 0 else 0
-        if aspect < cfg["min_aspect"] or aspect > cfg["max_aspect"]:
-            continue
-
-        # Text density check: names should have decent ink coverage
-        roi = binary[y:y+bh, x:x+bw]
-        fill = cv2.countNonZero(roi) / (bw * bh)
-        if fill < cfg["min_fill"]:
-            continue
-
-        candidates.append({
-            "bbox": [x, y, x+bw, y+bh],
-            "cy": y + bh // 2,
-            "top": y,
-        })
-
-    if not candidates:
-        return []
-
-    # Sort by vertical position (top to bottom)
-    candidates.sort(key=lambda c: c["top"])
-
-    # Cluster: group lines that are close vertically (same comment row)
-    # Then keep only the TOPMOST line in each cluster → that's the name
-    merged = []
-    cluster = [candidates[0]]
-    threshold = cfg["cluster_threshold"]
-
-    for c in candidates[1:]:
-        if abs(c["top"] - cluster[-1]["top"]) < threshold:
-            cluster.append(c)
-        else:
-            # Keep topmost in cluster
-            cluster.sort(key=lambda x: x["top"])
-            merged.append(cluster[0])
-            cluster = [c]
-
-    # Last cluster
-    cluster.sort(key=lambda x: x["top"])
-    merged.append(cluster[0])
-
-    return [{"bbox": m["bbox"]} for m in merged]
-
-
-# ============== CENSOR ENGINE ==============
-def apply_censor(image, boxes, blur_radius=22):
-    if not boxes:
-        return image.convert("RGB")
-
-    img = image.convert("RGBA")
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-
-    for box in boxes:
-        try:
-            x1, y1, x2, y2 = map(int, box["bbox"])
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(img.width, x2), min(img.height, y2)
-
-            if x2 > x1 and y2 > y1:
-                region = img.crop((x1, y1, x2, y2))
-                blurred = region.filter(ImageFilter.GaussianBlur(radius=blur_radius))
-                img.paste(blurred, (x1, y1))
-                draw.rectangle([x1, y1, x2, y2], fill=(0, 0, 0, 100))
-        except Exception:
-            continue
-
-    return Image.alpha_composite(img, overlay).convert("RGB")
-
-
-def draw_overlay(image, boxes):
-    """Blue boxes for preview."""
-    img = image.convert("RGBA")
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-
-    for box in boxes:
-        try:
-            x1, y1, x2, y2 = map(int, box["bbox"])
-            draw.rectangle([x1, y1, x2, y2], outline=(50, 150, 255, 220), width=4)
-            draw.text((x1 + 2, max(0, y1 - 18)), "NAME", fill=(50, 150, 255, 220))
-        except Exception:
-            continue
-
-    return Image.alpha_composite(img, overlay).convert("RGB")
-
-
-# ============== ZIP BUILDER ==============
-def build_zip(processed):
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for filename, data in processed:
-            zf.writestr(filename, data)
-    buf.seek(0)
-    return buf.getvalue()
-
-
-# ============== UI ==============
-st.title("🛡️ Auto Censor — Names Only (Text Detect)")
-st.caption("Detects name text lines with OpenCV → blurs only names. No avatars. 100% free, local processing.")
-
-# Sidebar: detection parameters
+# Input API Key di Sidebar
 with st.sidebar:
-    st.header("⚙️ Detection Parameters")
-    st.caption("Tune these if names are missed or wrong text gets blurred.")
-
-    # Position
-    min_x = st.slider("Left margin (px)", 20, 150, 60, 5,
-                      help="Ignore text left of this X. Names start after avatar space.")
-    max_x_ratio = st.slider("Max X ratio", 0.3, 0.9, 0.65, 0.05,
-                            help="Ignore text beyond this % of image width.")
-
-    # Size
-    min_h = st.slider("Min text height (px)", 8, 30, 15, 1,
-                      help="Names must be at least this tall.")
-    max_h = st.slider("Max text height (px)", 25, 80, 42, 1,
-                      help="Names must be no taller than this.")
-    min_w = st.slider("Min text width (px)", 40, 150, 80, 5,
-                      help="Names must be at least this wide.")
-    max_w = st.slider("Max text width (px)", 200, 600, 380, 10,
-                      help="Names must be no wider than this.")
-
-    # Shape
-    min_aspect = st.slider("Min aspect ratio (w/h)", 1.0, 5.0, 2.0, 0.1,
-                           help="Names are wide & short. Lower = more lenient.")
-    max_aspect = st.slider("Max aspect ratio (w/h)", 8.0, 30.0, 18.0, 1.0,
-                           help="Upper limit. Prevents catching super-wide UI bars.")
-
-    # Morphology
-    kernel_ratio = st.slider("Connect kernel width (% of image)", 0.005, 0.03, 0.012, 0.001,
-                             help="Wider = connects letters into longer lines. Narrower = more fragmented.")
-    kernel_h = st.slider("Connect kernel height", 1, 8, 3, 1,
-                         help="Taller = catches bold/thicker text.")
-    dilate_v = st.slider("Vertical dilation", 0, 5, 1,
-                         help="Extra vertical expansion after connecting. Helps catch bold names.")
-
-    # Quality
-    min_fill = st.slider("Min text fill ratio", 0.02, 0.25, 0.07, 0.01,
-                         help="Minimum black-pixel density in the box. Filters out empty regions.")
-    cluster_threshold = st.slider("Row cluster threshold (px)", 20, 100, 50, 5,
-                                  help="Lines within this vertical distance are grouped as one comment row. Only the topmost is kept as the name.")
-
-    # Censor
-    blur_radius = st.slider("Blur radius", 10, 40, 22, 2)
-    show_overlay = st.checkbox("Show detection overlay", value=True)
-
+    st.header("⚙️ Pengaturan AI")
+    api_key = st.text_input("Masukkan Gemini API Key Anda:", type="password")
+    st.markdown("[Dapatkan API Key Gratis di sini](https://aistudio.google.com/)")
+    
+    blur_radius = st.slider("Intensitas Blur:", min_value=5, max_value=50, value=25, step=5)
     st.divider()
-    st.success("✅ No API. No avatars. Just text detection.")
+    st.info("✅ 100% Menggunakan AI Vision. Tanpa teknik geometri OpenCV.")
 
-    # Preset buttons
-    st.markdown("**Quick Presets:**")
-    pc1, pc2 = st.columns(2)
-    if pc1.button("Standard", use_container_width=True):
-        st.session_state.update({"min_x": 60, "max_x_ratio": 0.65, "min_h": 15, "max_h": 42,
-                                 "min_w": 80, "max_w": 380, "min_aspect": 2.0, "max_aspect": 18.0,
-                                 "kernel_ratio": 0.012, "kernel_h": 3, "dilate_v": 1,
-                                 "min_fill": 0.07, "cluster_threshold": 50, "blur_radius": 22})
-        st.rerun()
-    if pc2.button("Tight (small names)", use_container_width=True):
-        st.session_state.update({"min_x": 55, "max_x_ratio": 0.60, "min_h": 12, "max_h": 35,
-                                 "min_w": 70, "max_w": 320, "min_aspect": 1.8, "max_aspect": 15.0,
-                                 "kernel_ratio": 0.010, "kernel_h": 2, "dilate_v": 0,
-                                 "min_fill": 0.08, "cluster_threshold": 45, "blur_radius": 20})
-        st.rerun()
+# ==========================================
+# 2. FUNGSI INTI (DETEKSI & SENSOR)
+# ==========================================
 
-# Build config dict
-cfg = {
-    "min_x": min_x,
-    "max_x_ratio": max_x_ratio,
-    "min_h": min_h,
-    "max_h": max_h,
-    "min_w": min_w,
-    "max_w": max_w,
-    "min_aspect": min_aspect,
-    "max_aspect": max_aspect,
-    "kernel_ratio": kernel_ratio,
-    "kernel_h": kernel_h,
-    "dilate_v": dilate_v,
-    "min_fill": min_fill,
-    "cluster_threshold": cluster_threshold,
-}
+def get_gemini_response(image_pil, prompt, api_key):
+    """Mengirim gambar ke Gemini dan mendapatkan respon teks (JSON)."""
+    genai.configure(api_key=api_key)
+    model = GenerativeModel('gemini-1.5-flash') # Model flash lebih cepat & murah untuk vision
+    
+    # Konversi PIL ke bytes untuk API
+    img_byte_arr = io.BytesIO()
+    image_pil.save(img_byte_arr, format='PNG')
+    img_bytes = img_byte_arr.getvalue()
+    
+    # Kirim ke model
+    response = model.generate_content([
+        prompt, 
+        {'mime_type': 'image/png', 'data': img_bytes}
+    ])
+    return response.text
 
-# Upload area
-st.divider()
-st.subheader("📷 Upload Images")
+def apply_censor_to_coordinates(image_pil, normalized_boxes, blur_radius):
+    """Menerapkan Gaussian Blur pada area koordinat yang diberikan."""
+    width, height = image_pil.size
+    censored_image = image_pil.copy()
+    draw = PIL.ImageDraw.Draw(censored_image)
+    
+    for box in normalized_boxes:
+        # Gemini mengembalikan koordinat normalisasi (0-1000).
+        # Kita perlu mengonversinya kembali ke piksel asli gambar[cite: 1.1.2].
+        # Format Gemini biasanya: [ymin, xmin, ymax, xmax][cite: 1.1.2]
+        ymin, xmin, ymax, xmax = box
+        
+        # Konversi ke piksel asli
+        left = xmin * width / 1000
+        top = ymin * height / 1000
+        right = xmax * width / 1000
+        bottom = ymax * height / 1000
+        
+        # Buat kotak koordinat (x1, y1, x2, y2)
+        target_box = (left, top, right, bottom)
+        
+        # 1. Potong area nama
+        face_crop = image_pil.crop(target_box)
+        
+        # 2. Terapkan Gaussian Blur pada potongan tersebut
+        blurred_face = face_crop.filter(PIL.Imagefilter.GaussianBlur(radius=blur_radius))
+        
+        # 3. Tempelkan kembali potongan yang buram ke gambar asli
+        censored_image.paste(blurred_face, (int(left), int(top)))
+        
+    return censored_image
 
-col1, col2 = st.columns(2)
+# ==========================================
+# 3. PROMPT KHUSUS UNTUK GEMINI
+# ==========================================
+# Prompt ini sangat krusial agar Gemini mengembalikan JSON murni dengan koordinat[cite: 1.1.2].
+AIM_PROMPT = """
+Analisis gambar tangkapan layar komentar media sosial ini.
+Identifikasi setiap nama pengguna (username/account name) yang dicetak TEBAL (BOLD) pada bagian komentar.
+Jangan identifikasi teks komentar biasa, jangan identifikasi timestamp. Hanya nama yang ditebalkan.
 
-with col1:
-    st.markdown("**Main Images**")
-    main_files = st.file_uploader(
-        "Upload main screenshots",
-        type=["png", "jpg", "jpeg"],
-        accept_multiple_files=True,
-        key="main",
-        label_visibility="collapsed",
-    )
+Kembalikan hasilnya dalam format JSON murni, tanpa teks penjelasan lain di luar JSON.
+JSON harus berupa array dari objek. Setiap objek memiliki kunci 'nama' (teks nama) dan kunci 'kotak' (array koordinat yang dinormalisasi [ymin, xmin, ymax, xmax]).
 
-with col2:
-    st.markdown("**Comment Images**")
-    comment_files = st.file_uploader(
-        "Upload comment screenshots",
-        type=["png", "jpg", "jpeg"],
-        accept_multiple_files=True,
-        key="comment",
-        label_visibility="collapsed",
-    )
+Contoh Output:
+[
+  {"nama": "UserA", "kotak": [120, 50, 150, 200]},
+  {"nama": "UserB", "kotak": [300, 50, 330, 220]}
+]
+"""
 
-all_files = []
-if main_files:
-    all_files.extend([("main", f) for f in main_files])
-if comment_files:
-    all_files.extend([("comment", f) for f in comment_files])
+# ==========================================
+# 4. ALUR KERJA UI STREAMLIT
+# ==========================================
 
-if not all_files:
-    st.info("👆 Upload images to start.")
-    st.stop()
+# Kolom Unggah Gambar
+uploaded_files = st.file_uploader(
+    "Unggah tangkapan layar komentar (PNG/JPG)", 
+    type=["png", "jpg", "jpeg"], 
+    accept_multiple_files=True
+)
 
-# Process
-st.divider()
-process_btn = st.button("🚀 Detect & Censor Names Only", type="primary", use_container_width=True)
-
-if process_btn:
-    status = st.empty()
-    progress = st.progress(0)
-
-    main_results = []
-    comment_results = []
-    total = len(all_files)
-
-    for i, (batch_type, uploaded_file) in enumerate(all_files):
-        status.info(f"🔍 [{i+1}/{total}] Detecting names in **{uploaded_file.name}**...")
-
-        try:
-            uploaded_file.seek(0)
-            image = Image.open(uploaded_file).convert("RGB")
-
-            # Detect names
-            name_boxes = detect_names(image, cfg)
-
-            # Censor
-            censored = apply_censor(image, name_boxes, blur_radius)
-
-            # Export
-            buf = io.BytesIO()
-            censored.save(buf, format="PNG")
-            buf.seek(0)
-
-            item = {
-                "filename": uploaded_file.name,
-                "original": image,
-                "censored": censored,
-                "overlay": draw_overlay(image, name_boxes) if show_overlay else None,
-                "names": len(name_boxes),
-                "bytes": buf.getvalue(),
-            }
-
-            if batch_type == "main":
-                main_results.append(item)
-            else:
-                comment_results.append(item)
-
-        except Exception as e:
-            st.error(f"❌ Failed on **{uploaded_file.name}**: {e}")
-
-        progress.progress((i + 1) / total)
-
-    status.empty()
-    progress.empty()
-
-    # Display
-    if main_results or comment_results:
-        st.divider()
-        st.subheader("📋 Results")
-
-        all_results = main_results + comment_results
-        total_names = sum(r["names"] for r in all_results)
-        st.success(
-            f"✅ Processed {len(main_results)} main + {len(comment_results)} comment images. "
-            f"**{total_names}** name box(es) detected & censored."
+if uploaded_files:
+    if not api_key:
+        st.error("❌ Silakan masukkan Gemini API Key Anda di sidebar untuk melanjutkan.")
+        st.stop()
+        
+    st.divider()
+    st.subheader(f"🔄 Memproses {len(uploaded_files)} Gambar...")
+    
+    # Placeholder untuk tombol unduh massal
+    download_placeholder = st.empty()
+    
+    # Siapkan ZIP di memori untuk unduhan massal
+    zip_buffer = io.BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+        progress_bar = st.progress(0)
+        
+        for index, uploaded_file in enumerate(uploaded_files):
+            try:
+                # 1. Baca gambar sebagai PIL
+                image = PIL.Image.open(uploaded_file).convert("RGB")
+                filename = uploaded_file.name
+                
+                # 2. Panggil AI untuk mendapatkan koordinat
+                with st.spinner(f"AI sedang membaca {filename}..."):
+                    response_text = get_gemini_response(image, AIM_PROMPT, api_key)
+                
+                # 3. Parse JSON dari respon AI
+                # Terkadang AI menambahkan markdown ```json ... ```, kita hapus jika ada.
+                json_clean = response_text.replace("```json", "").replace("```", "").strip()
+                name_data = json.loads(json_clean)
+                
+                # 4. Ekstrak hanya koordinat kotak
+                coordinates = [item['kotak'] for item in name_data if 'kotak' in item]
+                
+                # 5. Terapkan Sensor Pillow
+                censored_image = apply_censor_to_coordinates(image, coordinates, blur_radius)
+                
+                # 6. Tampilkan Hasil
+                with st.container(border=True):
+                    col1, col2 = st.columns(2)
+                    col1.image(image, caption=f"Asli: {filename}", use_container_width=True)
+                    col2.image(censored_image, caption=f"Disensor: {len(coordinates)} Nama", use_container_width=True)
+                
+                # 7. Simpan ke ZIP
+                img_byte_arr = io.BytesIO()
+                censored_image.save(img_byte_arr, format='PNG')
+                zip_file.writestr(f"censored_{filename}", img_byte_arr.getvalue())
+                
+            except json.JSONDecodeError:
+                st.error(f"❌ Gagal membaca data JSON dari AI untuk {filename}. Respon AI: {response_text}")
+            except Exception as e:
+                st.error(f"❌ Terjadi kesalahan pada {filename}: {str(e)}")
+                
+            progress_bar.progress((index + 1) / len(uploaded_files))
+            
+        # Tombol Unduh Massal
+        zip_buffer.seek(0)
+        download_placeholder.download_button(
+            label="📦 Unduh Semua Gambar Disensor (.zip)",
+            data=zip_buffer,
+            file_name="semua_gambar_disensor.zip",
+            mime="application/zip",
+            use_container_width=True
         )
+        st.success("✅ Semua gambar selesai diproses.")
 
-        for item in all_results:
-            with st.container(border=True):
-                st.markdown(f"**{item['filename']}** — `{item['names']}` name(s)")
-
-                if item["names"] == 0:
-                    st.warning("⚠️ No names detected. Try adjusting parameters in the sidebar (lower Min Height, widen Max Width, etc.)")
-
-                cols = st.columns([1, 1])
-
-                if show_overlay and item["overlay"] is not None:
-                    cols[0].image(item["overlay"], caption="Overlay (blue = name)", use_container_width=True)
-                else:
-                    cols[0].image(item["original"], caption="Original", use_container_width=True)
-
-                cols[1].image(item["censored"], caption="Censored (names only)", use_container_width=True)
-
-        # Download
-        st.divider()
-        st.subheader("📥 Download")
-        dl_cols = st.columns(2)
-
-        if main_results:
-            main_zip = build_zip([(r["filename"], r["bytes"]) for r in main_results])
-            dl_cols[0].download_button(
-                "📦 Download main.zip",
-                data=main_zip,
-                file_name="main.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
-
-        if comment_results:
-            comment_zip = build_zip([(r["filename"], r["bytes"]) for r in comment_results])
-            dl_cols[1].download_button(
-                "📦 Download comment.zip",
-                data=comment_zip,
-                file_name="comment.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
-
-        st.caption("Filenames preserved exactly as uploaded. Exported as PNG.")
+elif not uploaded_files:
+    st.info("👆 Silakan unggah satu atau beberapa gambar untuk memulai.")
