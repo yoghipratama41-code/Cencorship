@@ -4,11 +4,28 @@ import PIL.ImageDraw
 import json
 import io
 import re
+import time
+import random
 import zipfile
 import difflib
 import numpy as np
 import google.generativeai as genai
 import easyocr
+
+# ==========================================
+# 0. KONFIGURASI MODEL FALLBACK (biar ga kena rate limit)
+# ==========================================
+# Urutan prioritas model, dari yang paling murah/cepat ke yang lebih besar.
+# Kalau satu model kena limit (429/503), otomatis pindah ke model berikutnya.
+MODEL_PRIORITY = [
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-3-flash",
+    "gemini-3.5-flash",
+    "gemini-2.5-flash",
+]
+
+MAX_RETRY_PER_MODEL = 3
 
 # ==========================================
 # 1. KONFIGURASI SISTEM & AI
@@ -61,31 +78,61 @@ def load_ocr_reader():
 
 
 # ==========================================
-# 3. FUNGSI GEMINI — HANYA UNTUK IDENTIFIKASI NAMA (bukan koordinat)
+# 3. FUNGSI GEMINI — IDENTIFIKASI NAMA + FALLBACK GANTI MODEL
 # ==========================================
-def get_gemini_response(image_pil, prompt, api_key):
-    """Mengirim gambar ke Gemini dengan deteksi model dinamis."""
-    genai.configure(api_key=api_key)
+def get_model_fallback_list():
+    """Susun daftar model yang benar-benar tersedia di akun ini, sesuai MODEL_PRIORITY."""
+    available = [m.name for m in genai.list_models() if "generateContent" in m.supported_generation_methods]
+    ordered = []
+    for key in MODEL_PRIORITY:
+        match = next((m for m in available if key in m), None)
+        if match and match not in ordered:
+            ordered.append(match)
+    # Jaga-jaga: kalau tidak ada satupun yang cocok, pakai apa saja yang tersedia
+    if not ordered:
+        ordered = available[:3]
+    return ordered
 
-    available_models = [m.name for m in genai.list_models() if "generateContent" in m.supported_generation_methods]
 
-    chosen_model = "gemini-1.5-flash-latest"
-    for m_name in available_models:
-        if "flash" in m_name:
-            chosen_model = m_name.replace("models/", "")
-            break
-
-    model = genai.GenerativeModel(chosen_model)
-
+def get_gemini_response(image_pil, prompt, model_names, status_box, max_retry_per_model=MAX_RETRY_PER_MODEL):
+    """
+    Kirim gambar ke Gemini. Kalau satu model kena limit/sibuk (429/503/RESOURCE_EXHAUSTED),
+    tunggu dengan backoff lalu retry; kalau tetap gagal setelah beberapa percobaan,
+    pindah ke model berikutnya di daftar fallback.
+    """
     img_byte_arr = io.BytesIO()
     image_pil.save(img_byte_arr, format='PNG')
     img_bytes = img_byte_arr.getvalue()
+    gambar_part = {'mime_type': 'image/png', 'data': img_bytes}
 
-    response = model.generate_content([
-        prompt,
-        {'mime_type': 'image/png', 'data': img_bytes}
-    ])
-    return response.text
+    last_err = None
+    for model_name in model_names:
+        model = genai.GenerativeModel(model_name)
+        delay = 10
+        nama_model_pendek = model_name.split("/")[-1]
+
+        for attempt in range(max_retry_per_model):
+            try:
+                time.sleep(2)
+                response = model.generate_content([prompt, gambar_part])
+                return response.text, nama_model_pendek
+            except Exception as e:
+                err_msg = str(e)
+                last_err = e
+                if "429" in err_msg or "503" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                    wait_time = delay + random.uniform(0, 5)
+                    status_box.warning(
+                        f"⚠️ Model **{nama_model_pendek}** kena limit/sibuk "
+                        f"(percobaan {attempt + 1}/{max_retry_per_model}). Menunggu {wait_time:.1f}s..."
+                    )
+                    time.sleep(wait_time)
+                    delay *= 2
+                else:
+                    status_box.warning(f"⚠️ Model **{nama_model_pendek}** error: {err_msg[:150]}")
+                    break
+        status_box.info(f"➡️ Pindah dari model **{nama_model_pendek}** ke model berikutnya...")
+
+    raise Exception(f"Semua model gagal dicoba. Error terakhir: {last_err}")
 
 
 AIM_PROMPT = """
@@ -210,8 +257,12 @@ if uploaded_files:
 
     reader = load_ocr_reader()
 
+    genai.configure(api_key=api_key)
+    model_fallback_list = get_model_fallback_list()
+
     st.divider()
     st.subheader(f"🔄 Memproses {len(uploaded_files)} Gambar...")
+    st.caption(f"Urutan model fallback: {', '.join(m.split('/')[-1] for m in model_fallback_list)}")
 
     download_placeholder = st.empty()
     zip_buffer = io.BytesIO()
@@ -226,9 +277,13 @@ if uploaded_files:
                 # 1. Baca gambar
                 image = PIL.Image.open(uploaded_file).convert("RGB")
 
-                # 2. Gemini: identifikasi NAMA saja (tanpa koordinat)
+                # 2. Gemini: identifikasi NAMA saja (tanpa koordinat), dengan fallback ganti model
+                status_box = st.empty()
                 with st.spinner(f"Gemini membaca nama di {filename}..."):
-                    response_text = get_gemini_response(image, AIM_PROMPT, api_key)
+                    response_text, model_dipakai = get_gemini_response(
+                        image, AIM_PROMPT, model_fallback_list, status_box
+                    )
+                status_box.caption(f"✅ Berhasil pakai model: **{model_dipakai}**")
 
                 json_clean = response_text.replace("```json", "").replace("```", "").strip()
                 name_list = json.loads(json_clean)
