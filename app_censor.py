@@ -1,7 +1,7 @@
 import streamlit as st
 import PIL.Image
 import PIL.ImageDraw
-import PIL.Imagefilter
+import PIL.ImageFilter
 import json
 import io
 import zipfile
@@ -77,7 +77,7 @@ def apply_censor_to_coordinates(image_pil, normalized_boxes, blur_radius):
         face_crop = image_pil.crop(target_box)
         
         # 2. Terapkan Gaussian Blur pada potongan tersebut
-        blurred_face = face_crop.filter(PIL.Imagefilter.GaussianBlur(radius=blur_radius))
+        blurred_face = face_crop.filter(PIL.ImageFilter.GaussianBlur(radius=blur_radius))
         
         # 3. Tempelkan kembali potongan yang buram ke gambar asli
         censored_image.paste(blurred_face, (int(left), int(top)))
