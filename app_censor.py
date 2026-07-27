@@ -8,120 +8,95 @@ from PIL import Image, ImageDraw, ImageFilter
 import cv2
 
 # ============== CONFIG ==============
-st.set_page_config(page_title="Auto Censor — Names Only (Avatar-Guided)", page_icon="🛡️", layout="wide")
+st.set_page_config(page_title="Auto Censor — Names Only (Text Detect)", page_icon="🛡️", layout="wide")
 
 
-# ============== DETECT AVATARS (OpenCV) ==============
-def detect_avatars(image, sensitivity=1.0):
+# ============== NAME DETECTION (OpenCV Text Lines) ==============
+def detect_names(image, cfg):
     """
-    Detect circular profile-picture avatars on the left side.
-    Returns list of {"cx", "cy", "r", "bbox"} for each avatar.
+    Detect name text regions using morphological line detection.
+    Names = short horizontal text lines at the top of each comment row,
+    positioned to the right of the avatar margin.
     """
     img_array = np.array(image.convert("RGB"))
     h, w = img_array.shape[:2]
 
-    # Resize very large images for speed
-    scale = 1.0
-    if max(h, w) > 1600:
-        scale = 1600 / max(h, w)
-        new_w, new_h = int(w * scale), int(h * scale)
-        img_resized = cv2.resize(img_array, (new_w, new_h))
-    else:
-        img_resized = img_array
+    gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
 
-    gray = cv2.cvtColor(img_resized, cv2.COLOR_RGB2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 40, 150)
+    # Adaptive threshold: text becomes white on black
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # Close small gaps in circle edges
-    kernel = np.ones((3, 3), np.uint8)
-    edges = cv2.dilate(edges, kernel, iterations=1)
+    # Morphological closing with wide horizontal kernel → connects letters into lines
+    kernel_w = max(10, int(w * cfg["kernel_ratio"]))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, cfg["kernel_h"]))
+    closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
 
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # Optional: dilate vertically a bit to catch bold names
+    if cfg["dilate_v"] > 0:
+        v_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, cfg["dilate_v"]))
+        closed = cv2.dilate(closed, v_kernel, iterations=1)
 
-    avatars = []
-    min_area = int(180 * sensitivity)
-    max_area = int(4000 / sensitivity)
-    min_circularity = 0.68 * sensitivity
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+    candidates = []
     for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < min_area or area > max_area:
-            continue
-
-        perimeter = cv2.arcLength(cnt, True)
-        if perimeter == 0:
-            continue
-
-        circularity = 4 * math.pi * area / (perimeter ** 2)
-        if circularity < min_circularity:
-            continue
-
         x, y, bw, bh = cv2.boundingRect(cnt)
-        if not (0.55 < bw / bh < 1.8):
+
+        # Position: must be to the right of avatar space
+        if x < cfg["min_x"]:
+            continue
+        if x > w * cfg["max_x_ratio"]:
             continue
 
-        # Scale back to original coordinates
-        if scale < 1.0:
-            x, y, bw, bh = int(x / scale), int(y / scale), int(bw / scale), int(bh / scale)
-
-        cx = x + bw // 2
-        cy = y + bh // 2
-        radius = max(bw, bh) // 2
-
-        # Avatars are always on the left side
-        if cx > w * 0.40:
+        # Size filters
+        if bh < cfg["min_h"] or bh > cfg["max_h"]:
+            continue
+        if bw < cfg["min_w"] or bw > cfg["max_w"]:
             continue
 
-        avatars.append({
-            "cx": cx,
-            "cy": cy,
-            "r": int(radius * 1.15),  # slight padding
-            "bbox": [max(0, cx - radius - 2), max(0, cy - radius - 2),
-                     min(w, cx + radius + 2), min(h, cy + radius + 2)]
+        # Aspect ratio: names are wide and short
+        aspect = bw / bh if bh > 0 else 0
+        if aspect < cfg["min_aspect"] or aspect > cfg["max_aspect"]:
+            continue
+
+        # Text density check: names should have decent ink coverage
+        roi = binary[y:y+bh, x:x+bw]
+        fill = cv2.countNonZero(roi) / (bw * bh)
+        if fill < cfg["min_fill"]:
+            continue
+
+        candidates.append({
+            "bbox": [x, y, x+bw, y+bh],
+            "cy": y + bh // 2,
+            "top": y,
         })
 
-    # Deduplicate by center proximity
-    avatars = deduplicate_avatars(avatars)
-    return avatars
+    if not candidates:
+        return []
 
+    # Sort by vertical position (top to bottom)
+    candidates.sort(key=lambda c: c["top"])
 
-def deduplicate_avatars(avatars, min_dist=35):
-    """Remove duplicate avatar detections."""
-    filtered = []
-    for a in avatars:
-        too_close = False
-        for b in filtered:
-            if math.dist((a["cx"], a["cy"]), (b["cx"], b["cy"])) < min_dist:
-                too_close = True
-                break
-        if not too_close:
-            filtered.append(a)
-    return filtered
+    # Cluster: group lines that are close vertically (same comment row)
+    # Then keep only the TOPMOST line in each cluster → that's the name
+    merged = []
+    cluster = [candidates[0]]
+    threshold = cfg["cluster_threshold"]
 
+    for c in candidates[1:]:
+        if abs(c["top"] - cluster[-1]["top"]) < threshold:
+            cluster.append(c)
+        else:
+            # Keep topmost in cluster
+            cluster.sort(key=lambda x: x["top"])
+            merged.append(cluster[0])
+            cluster = [c]
 
-# ============== DERIVE NAME BOXES FROM AVATARS ==============
-def derive_name_boxes(avatars, image_width, image_height, name_width=300, name_height_factor=0.65):
-    """
-    For each detected avatar, create a name box immediately to its right.
-    """
-    boxes = []
-    for av in avatars:
-        cx, cy, r = av["cx"], av["cy"], av["r"]
+    # Last cluster
+    cluster.sort(key=lambda x: x["top"])
+    merged.append(cluster[0])
 
-        # Name box starts just right of avatar
-        x1 = cx + r + 4
-        y1 = max(0, cy - int(r * name_height_factor))
-        x2 = min(image_width, x1 + name_width)
-        y2 = min(image_height, cy + int(r * name_height_factor) + 4)
-
-        # Sanity: name box must be reasonably sized
-        if (x2 - x1) < 60 or (y2 - y1) < 12:
-            continue
-
-        boxes.append({"bbox": [x1, y1, x2, y2]})
-
-    return boxes
+    return [{"bbox": m["bbox"]} for m in merged]
 
 
 # ============== CENSOR ENGINE ==============
@@ -150,23 +125,19 @@ def apply_censor(image, boxes, blur_radius=22):
     return Image.alpha_composite(img, overlay).convert("RGB")
 
 
-def draw_overlay(image, avatars, name_boxes):
-    """Preview: green = avatar (detected, NOT blurred), blue = name (will be blurred)."""
+def draw_overlay(image, boxes):
+    """Blue boxes for preview."""
     img = image.convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
 
-    # Avatars in green outline (these stay visible)
-    for av in avatars:
-        x1, y1, x2, y2 = av["bbox"]
-        draw.rectangle([x1, y1, x2, y2], outline=(50, 220, 50, 200), width=3)
-        draw.text((x1, max(0, y1 - 16)), "AVATAR", fill=(50, 220, 50, 200))
-
-    # Names in blue outline (these get blurred)
-    for box in name_boxes:
-        x1, y1, x2, y2 = map(int, box["bbox"])
-        draw.rectangle([x1, y1, x2, y2], outline=(50, 150, 255, 220), width=4)
-        draw.text((x1 + 2, max(0, y1 - 18)), "NAME", fill=(50, 150, 255, 220))
+    for box in boxes:
+        try:
+            x1, y1, x2, y2 = map(int, box["bbox"])
+            draw.rectangle([x1, y1, x2, y2], outline=(50, 150, 255, 220), width=4)
+            draw.text((x1 + 2, max(0, y1 - 18)), "NAME", fill=(50, 150, 255, 220))
+        except Exception:
+            continue
 
     return Image.alpha_composite(img, overlay).convert("RGB")
 
@@ -182,46 +153,89 @@ def build_zip(processed):
 
 
 # ============== UI ==============
-st.title("🛡️ Auto Censor — Names Only (Avatar-Guided)")
-st.caption("Detects circular avatars with OpenCV → creates name boxes to the right → blurs ONLY names. Profile pictures stay visible. 100% free, no API.")
+st.title("🛡️ Auto Censor — Names Only (Text Detect)")
+st.caption("Detects name text lines with OpenCV → blurs only names. No avatars. 100% free, local processing.")
 
-# Sidebar settings
+# Sidebar: detection parameters
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("⚙️ Detection Parameters")
+    st.caption("Tune these if names are missed or wrong text gets blurred.")
 
-    sensitivity = st.slider(
-        "Avatar detection sensitivity",
-        0.5, 1.5, 1.0, 0.1,
-        help="Higher = detects more circles (may include false positives). Lower = stricter."
-    )
+    # Position
+    min_x = st.slider("Left margin (px)", 20, 150, 60, 5,
+                      help="Ignore text left of this X. Names start after avatar space.")
+    max_x_ratio = st.slider("Max X ratio", 0.3, 0.9, 0.65, 0.05,
+                            help="Ignore text beyond this % of image width.")
 
-    name_width = st.slider(
-        "Name box width (px)",
-        150, 450, 300, 10,
-        help="How far right from each avatar to blur. Adjust if names are cut off or too much comment text is blurred."
-    )
+    # Size
+    min_h = st.slider("Min text height (px)", 8, 30, 15, 1,
+                      help="Names must be at least this tall.")
+    max_h = st.slider("Max text height (px)", 25, 80, 42, 1,
+                      help="Names must be no taller than this.")
+    min_w = st.slider("Min text width (px)", 40, 150, 80, 5,
+                      help="Names must be at least this wide.")
+    max_w = st.slider("Max text width (px)", 200, 600, 380, 10,
+                      help="Names must be no wider than this.")
 
-    name_height = st.slider(
-        "Name box height factor",
-        0.4, 1.0, 0.65, 0.05,
-        help="Name box height relative to avatar radius. Lower = tighter around name only."
-    )
+    # Shape
+    min_aspect = st.slider("Min aspect ratio (w/h)", 1.0, 5.0, 2.0, 0.1,
+                           help="Names are wide & short. Lower = more lenient.")
+    max_aspect = st.slider("Max aspect ratio (w/h)", 8.0, 30.0, 18.0, 1.0,
+                           help="Upper limit. Prevents catching super-wide UI bars.")
 
-    blur_radius = st.slider(
-        "Blur intensity",
-        10, 40, 22, 2,
-        help="Gaussian blur radius. Higher = more obscured."
-    )
+    # Morphology
+    kernel_ratio = st.slider("Connect kernel width (% of image)", 0.005, 0.03, 0.012, 0.001,
+                             help="Wider = connects letters into longer lines. Narrower = more fragmented.")
+    kernel_h = st.slider("Connect kernel height", 1, 8, 3, 1,
+                         help="Taller = catches bold/thicker text.")
+    dilate_v = st.slider("Vertical dilation", 0, 5, 1,
+                         help="Extra vertical expansion after connecting. Helps catch bold names.")
 
+    # Quality
+    min_fill = st.slider("Min text fill ratio", 0.02, 0.25, 0.07, 0.01,
+                         help="Minimum black-pixel density in the box. Filters out empty regions.")
+    cluster_threshold = st.slider("Row cluster threshold (px)", 20, 100, 50, 5,
+                                  help="Lines within this vertical distance are grouped as one comment row. Only the topmost is kept as the name.")
+
+    # Censor
+    blur_radius = st.slider("Blur radius", 10, 40, 22, 2)
     show_overlay = st.checkbox("Show detection overlay", value=True)
 
     st.divider()
-    st.success("✅ No API calls. Runs entirely on your machine.")
-    st.markdown("""
-    **Overlay Legend:**
-    - 🟢 **Green** = Avatar detected (stays visible)
-    - 🔵 **Blue** = Name box (gets blurred)
-    """)
+    st.success("✅ No API. No avatars. Just text detection.")
+
+    # Preset buttons
+    st.markdown("**Quick Presets:**")
+    pc1, pc2 = st.columns(2)
+    if pc1.button("Standard", use_container_width=True):
+        st.session_state.update({"min_x": 60, "max_x_ratio": 0.65, "min_h": 15, "max_h": 42,
+                                 "min_w": 80, "max_w": 380, "min_aspect": 2.0, "max_aspect": 18.0,
+                                 "kernel_ratio": 0.012, "kernel_h": 3, "dilate_v": 1,
+                                 "min_fill": 0.07, "cluster_threshold": 50, "blur_radius": 22})
+        st.rerun()
+    if pc2.button("Tight (small names)", use_container_width=True):
+        st.session_state.update({"min_x": 55, "max_x_ratio": 0.60, "min_h": 12, "max_h": 35,
+                                 "min_w": 70, "max_w": 320, "min_aspect": 1.8, "max_aspect": 15.0,
+                                 "kernel_ratio": 0.010, "kernel_h": 2, "dilate_v": 0,
+                                 "min_fill": 0.08, "cluster_threshold": 45, "blur_radius": 20})
+        st.rerun()
+
+# Build config dict
+cfg = {
+    "min_x": min_x,
+    "max_x_ratio": max_x_ratio,
+    "min_h": min_h,
+    "max_h": max_h,
+    "min_w": min_w,
+    "max_w": max_w,
+    "min_aspect": min_aspect,
+    "max_aspect": max_aspect,
+    "kernel_ratio": kernel_ratio,
+    "kernel_h": kernel_h,
+    "dilate_v": dilate_v,
+    "min_fill": min_fill,
+    "cluster_threshold": cluster_threshold,
+}
 
 # Upload area
 st.divider()
@@ -259,7 +273,7 @@ if not all_files:
     st.info("👆 Upload images to start.")
     st.stop()
 
-# Process button
+# Process
 st.divider()
 process_btn = st.button("🚀 Detect & Censor Names Only", type="primary", use_container_width=True)
 
@@ -272,20 +286,16 @@ if process_btn:
     total = len(all_files)
 
     for i, (batch_type, uploaded_file) in enumerate(all_files):
-        status.info(f"🔍 [{i+1}/{total}] Detecting avatars in **{uploaded_file.name}**...")
+        status.info(f"🔍 [{i+1}/{total}] Detecting names in **{uploaded_file.name}**...")
 
         try:
             uploaded_file.seek(0)
             image = Image.open(uploaded_file).convert("RGB")
-            w, h = image.size
 
-            # Step 1: Detect avatars (OpenCV, free, local)
-            avatars = detect_avatars(image, sensitivity)
+            # Detect names
+            name_boxes = detect_names(image, cfg)
 
-            # Step 2: Derive name boxes from avatar positions
-            name_boxes = derive_name_boxes(avatars, w, h, name_width, name_height)
-
-            # Step 3: Censor only names
+            # Censor
             censored = apply_censor(image, name_boxes, blur_radius)
 
             # Export
@@ -297,8 +307,7 @@ if process_btn:
                 "filename": uploaded_file.name,
                 "original": image,
                 "censored": censored,
-                "overlay": draw_overlay(image, avatars, name_boxes) if show_overlay else None,
-                "avatars": len(avatars),
+                "overlay": draw_overlay(image, name_boxes) if show_overlay else None,
                 "names": len(name_boxes),
                 "bytes": buf.getvalue(),
             }
@@ -316,33 +325,29 @@ if process_btn:
     status.empty()
     progress.empty()
 
-    # Display results
+    # Display
     if main_results or comment_results:
         st.divider()
         st.subheader("📋 Results")
 
         all_results = main_results + comment_results
-        total_avatars = sum(r["avatars"] for r in all_results)
         total_names = sum(r["names"] for r in all_results)
         st.success(
             f"✅ Processed {len(main_results)} main + {len(comment_results)} comment images. "
-            f"Detected **{total_avatars}** avatar(s) → **{total_names}** name box(es)."
+            f"**{total_names}** name box(es) detected & censored."
         )
 
         for item in all_results:
             with st.container(border=True):
-                st.markdown(
-                    f"**{item['filename']}** — "
-                    f"Avatars: `{item['avatars']}` | Names: `{item['names']}`"
-                )
+                st.markdown(f"**{item['filename']}** — `{item['names']}` name(s)")
 
                 if item["names"] == 0:
-                    st.warning("⚠️ No avatars detected. Try increasing Sensitivity in the sidebar.")
+                    st.warning("⚠️ No names detected. Try adjusting parameters in the sidebar (lower Min Height, widen Max Width, etc.)")
 
                 cols = st.columns([1, 1])
 
                 if show_overlay and item["overlay"] is not None:
-                    cols[0].image(item["overlay"], caption="Overlay: 🟢 Avatar | 🔵 Name", use_container_width=True)
+                    cols[0].image(item["overlay"], caption="Overlay (blue = name)", use_container_width=True)
                 else:
                     cols[0].image(item["original"], caption="Original", use_container_width=True)
 
