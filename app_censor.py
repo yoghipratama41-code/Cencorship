@@ -1,7 +1,6 @@
 import streamlit as st
 import PIL.Image
 import PIL.ImageDraw
-import PIL.ImageFilter
 import json
 import io
 import zipfile
@@ -16,19 +15,19 @@ st.title("🛡️ AI Auto Censor — Nama Akun Sahaja")
 st.markdown("""
 Aplikasi ini menggunakan **Gemini AI Vision** untuk membaca teks pada tangkapan layar, 
 mengidentifikasi nama pengguna yang dicetak **tebal (bold)** pada komentar, 
-dan menyensornya secara otomatis. *Profile picture* tetap utuh.
+dan menyensornya secara otomatis dengan kotak hitam solid.
 """)
 
-# Input API Key di Sidebar (Mendukung fallback ke secrets.toml)
+# Input API Key di Sidebar
 with st.sidebar:
     st.header("⚙️ Pengaturan AI")
     default_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
     api_key = st.text_input("Masukkan Gemini API Key Anda:", type="password", value=default_key)
     st.markdown("[Dapatkan API Key Gratis di sini](https://aistudio.google.com/)")
     
-    blur_radius = st.slider("Intensitas Blur:", min_value=5, max_value=50, value=25, step=5)
+    pad_ukuran = st.slider("Lebar Ekstra Sensor (Padding px):", min_value=0, max_value=20, value=2, step=1)
     st.divider()
-    st.info("✅ 100% Menggunakan AI Vision. Tanpa teknik geometri OpenCV.")
+    st.info("✅ Menggunakan model Gemini 1.5 Flash untuk performa vision terbaik.")
 
 # ==========================================
 # 2. FUNGSI INTI (DETEKSI & SENSOR)
@@ -38,10 +37,10 @@ def get_gemini_response(image_pil, prompt, api_key):
     """Mengirim gambar ke Gemini dengan deteksi model dinamis."""
     genai.configure(api_key=api_key)
     
-    # 1. Cek model apa saja yang aktif dan tersedia di API Key kamu
+    # 1. Cek model apa saja yang aktif dan tersedia
     available_models = [m.name for m in genai.list_models() if "generateContent" in m.supported_generation_methods]
     
-    # 2. Cari model yang ada kata "flash" (karena ini yang paling cepat dan support Vision)
+    # 2. Cari model yang ada kata "flash"
     chosen_model = "gemini-1.5-flash-latest" # Fallback default
     for m_name in available_models:
         if "flash" in m_name:
@@ -50,7 +49,7 @@ def get_gemini_response(image_pil, prompt, api_key):
             
     model = genai.GenerativeModel(chosen_model)
     
-    # Konversi PIL ke bytes untuk API
+    # Konversi PIL ke bytes
     img_byte_arr = io.BytesIO()
     image_pil.save(img_byte_arr, format='PNG')
     img_bytes = img_byte_arr.getvalue()
@@ -62,36 +61,35 @@ def get_gemini_response(image_pil, prompt, api_key):
     ])
     return response.text
 
-def apply_censor_to_coordinates(image_pil, normalized_boxes, blur_radius):
-    """Menerapkan Gaussian Blur pada area koordinat yang diberikan."""
+def apply_censor_to_coordinates(image_pil, boxes, pad_ukuran):
+    """Menerapkan Blok Hitam pada area koordinat yang diberikan."""
     width, height = image_pil.size
     censored_image = image_pil.copy()
     draw = PIL.ImageDraw.Draw(censored_image)
     
-    for box in normalized_boxes:
-        # Gemini mengembalikan koordinat normalisasi (0-1000).
-        # Kita perlu mengonversinya kembali ke piksel asli gambar.
-        # Format Gemini biasanya: [ymin, xmin, ymax, xmax]
-        ymin, xmin, ymax, xmax = box
-        
-        # Konversi ke piksel asli
-        left = xmin * width / 1000
-        top = ymin * height / 1000
-        right = xmax * width / 1000
-        bottom = ymax * height / 1000
-        
-        # Buat kotak koordinat (x1, y1, x2, y2)
-        target_box = (left, top, right, bottom)
-        
-        # 1. Potong area nama
-        face_crop = image_pil.crop(target_box)
-        
-        # 2. Terapkan Gaussian Blur pada potongan tersebut (menggunakan ImageFilter dengan F besar)
-        blurred_face = face_crop.filter(PIL.ImageFilter.GaussianBlur(radius=blur_radius))
-        
-        # 3. Tempelkan kembali potongan yang buram ke gambar asli
-        censored_image.paste(blurred_face, (int(left), int(top)))
-        
+    for box in boxes:
+        if len(box) == 4:
+            # Deteksi apakah koordinatnya dinormalisasi (0-1000) atau piksel asli
+            is_normalized = all(v <= 1000 for v in box)
+            
+            if is_normalized:
+                ymin, xmin, ymax, xmax = box
+                left = (xmin / 1000) * width
+                right = (xmax / 1000) * width
+                top = (ymin / 1000) * height
+                bottom = (ymax / 1000) * height
+            else:
+                ymin, xmin, ymax, xmax = box
+                left, right = xmin, xmax
+                top, bottom = ymin, ymax
+
+            # PENGAMAN: Urutkan agar kotak tidak terbalik (lebar 0 piksel)
+            x1, x2 = sorted([left, right])
+            y1, y2 = sorted([top, bottom])
+            
+            # Gambar Kotak Hitam Solid dengan ekstra padding
+            draw.rectangle([x1 - pad_ukuran, y1 - pad_ukuran, x2 + pad_ukuran, y2 + pad_ukuran], fill="black")
+            
     return censored_image
 
 # ==========================================
@@ -116,7 +114,6 @@ Contoh Output:
 # 4. ALUR KERJA UI STREAMLIT
 # ==========================================
 
-# Kolom Unggah Gambar
 uploaded_files = st.file_uploader(
     "Unggah tangkapan layar komentar (PNG/JPG)", 
     type=["png", "jpg", "jpeg"], 
@@ -125,16 +122,13 @@ uploaded_files = st.file_uploader(
 
 if uploaded_files:
     if not api_key:
-        st.error("❌ Silakan masukkan Gemini API Key Anda di sidebar (atau atur di Streamlit Secrets) untuk melanjutkan.")
+        st.error("❌ Silakan masukkan Gemini API Key Anda di sidebar untuk melanjutkan.")
         st.stop()
         
     st.divider()
     st.subheader(f"🔄 Memproses {len(uploaded_files)} Gambar...")
     
-    # Placeholder untuk tombol unduh massal
     download_placeholder = st.empty()
-    
-    # Siapkan ZIP di memori untuk unduhan massal
     zip_buffer = io.BytesIO()
     
     with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
@@ -142,29 +136,33 @@ if uploaded_files:
         
         for index, uploaded_file in enumerate(uploaded_files):
             try:
-                # 1. Baca gambar sebagai PIL
+                # 1. Baca gambar
                 image = PIL.Image.open(uploaded_file).convert("RGB")
                 filename = uploaded_file.name
                 
-                # 2. Panggil AI untuk mendapatkan koordinat
+                # 2. Panggil AI
                 with st.spinner(f"AI sedang membaca {filename}..."):
                     response_text = get_gemini_response(image, AIM_PROMPT, api_key)
                 
-                # 3. Parse JSON dari respon AI
+                # 3. Parse JSON
                 json_clean = response_text.replace("```json", "").replace("```", "").strip()
                 name_data = json.loads(json_clean)
                 
-                # 4. Ekstrak hanya koordinat kotak
+                # 4. Ekstrak koordinat
                 coordinates = [item['kotak'] for item in name_data if 'kotak' in item]
                 
-                # 5. Terapkan Sensor Pillow
-                censored_image = apply_censor_to_coordinates(image, coordinates, blur_radius)
+                # 5. Terapkan Sensor Kotak Hitam
+                censored_image = apply_censor_to_coordinates(image, coordinates, pad_ukuran)
                 
                 # 6. Tampilkan Hasil
                 with st.container(border=True):
                     col1, col2 = st.columns(2)
                     col1.image(image, caption=f"Asli: {filename}", use_container_width=True)
                     col2.image(censored_image, caption=f"Disensor: {len(coordinates)} Nama", use_container_width=True)
+                    
+                    # Debugger: Lihat hasil JSON AI
+                    with st.expander("🛠️ Lihat Data JSON (Koordinat AI)"):
+                        st.json(name_data)
                 
                 # 7. Simpan ke ZIP
                 img_byte_arr = io.BytesIO()
@@ -178,7 +176,6 @@ if uploaded_files:
                 
             progress_bar.progress((index + 1) / len(uploaded_files))
             
-        # Tombol Unduh Massal
         zip_buffer.seek(0)
         download_placeholder.download_button(
             label="📦 Unduh Semua Gambar Disensor (.zip)",
