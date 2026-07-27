@@ -5,8 +5,6 @@ import PIL.ImageFilter
 import json
 import io
 import zipfile
-import time
-from google.generativeai import GenerativeModel
 import google.generativeai as genai
 
 # ==========================================
@@ -21,10 +19,11 @@ mengidentifikasi nama pengguna yang dicetak **tebal (bold)** pada komentar,
 dan menyensornya secara otomatis. *Profile picture* tetap utuh.
 """)
 
-# Input API Key di Sidebar
+# Input API Key di Sidebar (Mendukung fallback ke secrets.toml)
 with st.sidebar:
     st.header("⚙️ Pengaturan AI")
-    api_key = st.text_input("Masukkan Gemini API Key Anda:", type="password")
+    default_key = st.secrets.get("GEMINI_API_KEY", "") if hasattr(st, "secrets") else ""
+    api_key = st.text_input("Masukkan Gemini API Key Anda:", type="password", value=default_key)
     st.markdown("[Dapatkan API Key Gratis di sini](https://aistudio.google.com/)")
     
     blur_radius = st.slider("Intensitas Blur:", min_value=5, max_value=50, value=25, step=5)
@@ -36,9 +35,20 @@ with st.sidebar:
 # ==========================================
 
 def get_gemini_response(image_pil, prompt, api_key):
-    """Mengirim gambar ke Gemini dan mendapatkan respon teks (JSON)."""
+    """Mengirim gambar ke Gemini dengan deteksi model dinamis."""
     genai.configure(api_key=api_key)
-    model = GenerativeModel('gemini-1.5-flash') # Model flash lebih cepat & murah untuk vision
+    
+    # 1. Cek model apa saja yang aktif dan tersedia di API Key kamu
+    available_models = [m.name for m in genai.list_models() if "generateContent" in m.supported_generation_methods]
+    
+    # 2. Cari model yang ada kata "flash" (karena ini yang paling cepat dan support Vision)
+    chosen_model = "gemini-1.5-flash-latest" # Fallback default
+    for m_name in available_models:
+        if "flash" in m_name:
+            chosen_model = m_name.replace("models/", "")
+            break
+            
+    model = genai.GenerativeModel(chosen_model)
     
     # Konversi PIL ke bytes untuk API
     img_byte_arr = io.BytesIO()
@@ -60,8 +70,8 @@ def apply_censor_to_coordinates(image_pil, normalized_boxes, blur_radius):
     
     for box in normalized_boxes:
         # Gemini mengembalikan koordinat normalisasi (0-1000).
-        # Kita perlu mengonversinya kembali ke piksel asli gambar[cite: 1.1.2].
-        # Format Gemini biasanya: [ymin, xmin, ymax, xmax][cite: 1.1.2]
+        # Kita perlu mengonversinya kembali ke piksel asli gambar.
+        # Format Gemini biasanya: [ymin, xmin, ymax, xmax]
         ymin, xmin, ymax, xmax = box
         
         # Konversi ke piksel asli
@@ -76,7 +86,7 @@ def apply_censor_to_coordinates(image_pil, normalized_boxes, blur_radius):
         # 1. Potong area nama
         face_crop = image_pil.crop(target_box)
         
-        # 2. Terapkan Gaussian Blur pada potongan tersebut
+        # 2. Terapkan Gaussian Blur pada potongan tersebut (menggunakan ImageFilter dengan F besar)
         blurred_face = face_crop.filter(PIL.ImageFilter.GaussianBlur(radius=blur_radius))
         
         # 3. Tempelkan kembali potongan yang buram ke gambar asli
@@ -87,7 +97,6 @@ def apply_censor_to_coordinates(image_pil, normalized_boxes, blur_radius):
 # ==========================================
 # 3. PROMPT KHUSUS UNTUK GEMINI
 # ==========================================
-# Prompt ini sangat krusial agar Gemini mengembalikan JSON murni dengan koordinat[cite: 1.1.2].
 AIM_PROMPT = """
 Analisis gambar tangkapan layar komentar media sosial ini.
 Identifikasi setiap nama pengguna (username/account name) yang dicetak TEBAL (BOLD) pada bagian komentar.
@@ -116,7 +125,7 @@ uploaded_files = st.file_uploader(
 
 if uploaded_files:
     if not api_key:
-        st.error("❌ Silakan masukkan Gemini API Key Anda di sidebar untuk melanjutkan.")
+        st.error("❌ Silakan masukkan Gemini API Key Anda di sidebar (atau atur di Streamlit Secrets) untuk melanjutkan.")
         st.stop()
         
     st.divider()
@@ -142,7 +151,6 @@ if uploaded_files:
                     response_text = get_gemini_response(image, AIM_PROMPT, api_key)
                 
                 # 3. Parse JSON dari respon AI
-                # Terkadang AI menambahkan markdown ```json ... ```, kita hapus jika ada.
                 json_clean = response_text.replace("```json", "").replace("```", "").strip()
                 name_data = json.loads(json_clean)
                 
