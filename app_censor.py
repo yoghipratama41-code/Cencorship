@@ -1,63 +1,227 @@
 import streamlit as st
 import io
 import zipfile
+import math
 import time
 import random
 import re
 import json
 
-import google.generativeai as genai
+import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
+import cv2
+
+# Optional Gemini import
+try:
+    import google.generativeai as genai
+    HAS_GENAI = True
+except ImportError:
+    HAS_GENAI = False
 
 # ============== CONFIG ==============
-st.set_page_config(page_title="Auto Censor - Facebook Screenshot", page_icon="🛡️", layout="centered")
+st.set_page_config(page_title="Auto Censor v2", page_icon="🛡️", layout="wide")
 
-GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
-MODEL_PRIORITY = [
-    "gemini-3.1-flash-lite",
-    "gemini-2.5-flash-lite",
-    "gemini-3-flash",
-    "gemini-3.5-flash",
-    "gemini-2.5-flash",
-]
-MAX_RETRY = 3
+# ============== CENSOR ENGINE ==============
+def apply_censor(image, boxes):
+    """Apply Gaussian blur + dark overlay to bounding boxes."""
+    if not boxes:
+        return image.convert("RGB")
+
+    img = image.convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    for box in boxes:
+        try:
+            x1, y1, x2, y2 = map(int, box["bbox"])
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(img.width, x2), min(img.height, y2)
+
+            if x2 > x1 and y2 > y1:
+                region = img.crop((x1, y1, x2, y2))
+                blurred = region.filter(ImageFilter.GaussianBlur(radius=22))
+                img.paste(blurred, (x1, y1))
+                draw.rectangle([x1, y1, x2, y2], fill=(0, 0, 0, 120))
+        except Exception:
+            continue
+
+    return Image.alpha_composite(img, overlay).convert("RGB")
 
 
-# ============== HELPER: MODEL FALLBACK ==============
-def get_model_fallback_list():
-    genai.configure(api_key=GEMINI_API_KEY)
+def draw_overlay(image, boxes):
+    """Draw colored boxes on image for preview."""
+    img = image.convert("RGBA")
+    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    colors = {"profile_pic": (255, 50, 50, 200), "name": (50, 150, 255, 200)}
+
+    for box in boxes:
+        try:
+            x1, y1, x2, y2 = map(int, box["bbox"])
+            color = colors.get(box["type"], (255, 200, 0, 200))
+            draw.rectangle([x1, y1, x2, y2], outline=color, width=4)
+            label = box["type"].replace("_", " ").title()
+            draw.text((x1 + 2, max(0, y1 - 18)), label, fill=color)
+        except Exception:
+            continue
+
+    return Image.alpha_composite(img, overlay).convert("RGB")
+
+
+# ============== DETECTION: SMART CV (OpenCV) ==============
+def detect_opencv(image, sensitivity=1.0, name_width=280):
+    """
+    Detect profile pictures (circles on left) and names (text to the right).
+    Completely free, local processing, no API needed.
+    """
+    img_array = np.array(image.convert("RGB"))
+    h, w = img_array.shape[:2]
+
+    # Scale down very large images for faster processing
+    scale = 1.0
+    if max(h, w) > 1600:
+        scale = 1600 / max(h, w)
+        new_w, new_h = int(w * scale), int(h * scale)
+        img_resized = cv2.resize(img_array, (new_w, new_h))
+    else:
+        img_resized = img_array
+
+    gray = cv2.cvtColor(img_resized, cv2.COLOR_RGB2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 40, 150)
+
+    # Dilate to close small gaps in circle edges
+    kernel = np.ones((3, 3), np.uint8)
+    edges = cv2.dilate(edges, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    boxes = []
+    min_area = int(180 * sensitivity)
+    max_area = int(4000 / sensitivity)
+    min_circularity = 0.70 * sensitivity
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area or area > max_area:
+            continue
+
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter == 0:
+            continue
+
+        circularity = 4 * math.pi * area / (perimeter ** 2)
+
+        if circularity > min_circularity:
+            x, y, bw, bh = cv2.boundingRect(cnt)
+
+            # Must be roughly square (circles have aspect ratio ~1.0)
+            if not (0.55 < bw / bh < 1.8):
+                continue
+
+            # Scale back to original image coordinates
+            if scale < 1.0:
+                x, y, bw, bh = int(x / scale), int(y / scale), int(bw / scale), int(bh / scale)
+
+            center_x = x + bw // 2
+            center_y = y + bh // 2
+            radius = max(bw, bh) // 2
+
+            # CRITICAL: Only accept circles in the left portion (where Facebook avatars are)
+            if center_x > w * 0.40:
+                continue
+
+            # Profile pic box (slightly padded to ensure full circle is covered)
+            r = int(radius * 1.2)
+            pp_box = {
+                "type": "profile_pic",
+                "bbox": [
+                    max(0, center_x - r),
+                    max(0, center_y - r),
+                    min(w, center_x + r),
+                    min(h, center_y + r),
+                ],
+            }
+            boxes.append(pp_box)
+
+            # Name box: immediately to the right of the avatar
+            nx1 = center_x + r + 5
+            ny1 = max(0, center_y - r - 5)
+            nx2 = min(w, center_x + r + name_width)
+            ny2 = min(h, center_y + r + 10)
+
+            name_box = {
+                "type": "name",
+                "bbox": [nx1, ny1, nx2, ny2],
+            }
+            boxes.append(name_box)
+
+    # Deduplicate: remove boxes whose centers are too close (prevents double-detection)
+    boxes = deduplicate_boxes(boxes, min_distance=30)
+    return boxes
+
+
+def deduplicate_boxes(boxes, min_distance=30):
+    """Remove overlapping/near-duplicate boxes."""
+    filtered = []
+    for box in boxes:
+        cx = (box["bbox"][0] + box["bbox"][2]) / 2
+        cy = (box["bbox"][1] + box["bbox"][3]) / 2
+        too_close = False
+        for existing in filtered:
+            ex = (existing["bbox"][0] + existing["bbox"][2]) / 2
+            ey = (existing["bbox"][1] + existing["bbox"][3]) / 2
+            if math.dist((cx, cy), (ex, ey)) < min_distance:
+                too_close = True
+                break
+        if not too_close:
+            filtered.append(box)
+    return filtered
+
+
+# ============== DETECTION: GEMINI AI VISION ==============
+def get_gemini_models():
+    """Get available Gemini models with fallback priority."""
     available = [m.name for m in genai.list_models() if "generateContent" in m.supported_generation_methods]
+    priority = [
+        "gemini-3.1-flash-lite",
+        "gemini-2.5-flash-lite",
+        "gemini-3-flash",
+        "gemini-3.5-flash",
+        "gemini-2.5-flash",
+    ]
     ordered = []
-    for key in MODEL_PRIORITY:
+    for key in priority:
         match = next((m for m in available if key in m), None)
         if match and match not in ordered:
             ordered.append(match)
     return ordered
 
 
-def detect_regions(image, status_text=None):
-    """Detect profile pics and names using Gemini Vision with model fallback."""
-    models = get_model_fallback_list()
+def detect_gemini(image, api_key, status_box=None):
+    """Detect using Gemini Vision with model fallback."""
+    genai.configure(api_key=api_key)
+    models = get_gemini_models()
     if not models:
         raise Exception("No Gemini models available with generateContent support")
 
-    prompt = """
-    Analyze this Facebook group screenshot. Identify ALL profile pictures (circular avatars) and account names/usernames visible in the image.
+    prompt = """Analyze this Facebook group screenshot. Identify ALL profile pictures (circular avatars) and account names/usernames visible in the image.
 
-    Rules:
-    - Profile pictures: circular avatars on the left side of each post/comment entry.
-    - Account names: text immediately to the right of each profile picture (e.g., "Mike Lim", "Dash8889", "KnowledgeableHamster7601", "林财家").
-    - Include EVERY visible profile picture and name: main post author (if visible at top) and ALL commenters.
-    - If a name has an "Author" badge, verification badge, or role label next to it, include that badge inside the name bounding box.
-    - Do NOT include comment body text, timestamps, reaction buttons, "View more comments", or "Reply / Share" buttons.
-    - Return coordinates as [left, top, right, bottom] in pixels, relative to the original image.
+Rules:
+- Profile pictures: circular avatars on the left side of each post/comment entry.
+- Account names: text immediately to the right of each profile picture (e.g., "CaringHedgehog3125", "Mike Oxlong", "Kelvin Lim", "Dash8889", "KnowledgeableHamster7601").
+- Include EVERY visible profile picture and name: main post author (if visible at top) and ALL commenters.
+- If a name has an "Author" badge, verification badge, or role label next to it, include that badge inside the name bounding box.
+- Do NOT include comment body text, timestamps, reaction buttons, "View more comments", or "Reply / Share" buttons.
+- Return coordinates as [left, top, right, bottom] in pixels, relative to the original image.
 
-    Output ONLY a valid JSON array. No markdown code fences, no explanation:
-    [
-      {"type": "profile_pic", "bbox": [x1, y1, x2, y2]},
-      {"type": "name", "bbox": [x1, y1, x2, y2]}
-    ]
-    """
+Output ONLY a valid JSON array. No markdown code fences, no explanation:
+[
+  {"type": "profile_pic", "bbox": [x1, y1, x2, y2]},
+  {"type": "name", "bbox": [x1, y1, x2, y2]}
+]
+"""
 
     last_err = None
     for model_name in models:
@@ -65,7 +229,7 @@ def detect_regions(image, status_text=None):
         delay = 10
         short_name = model_name.split("/")[-1]
 
-        for attempt in range(MAX_RETRY):
+        for attempt in range(3):
             try:
                 time.sleep(1)
                 response = model.generate_content([prompt, image])
@@ -77,218 +241,308 @@ def detect_regions(image, status_text=None):
                     text = re.sub(r"^```\s*", "", text)
                     text = re.sub(r"\s*```$", "", text)
 
-                boxes = json.loads(text)
-                return boxes
+                return json.loads(text)
 
             except Exception as e:
                 last_err = e
                 err_msg = str(e)
                 if "429" in err_msg or "503" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
                     wait_time = delay + random.uniform(0, 5)
-                    if status_text is not None:
-                        status_text.info(
-                            f"⏳ Model **{short_name}** busy (attempt {attempt+1}/{MAX_RETRY}). "
+                    if status_box is not None:
+                        status_box.info(
+                            f"⏳ Model **{short_name}** busy (attempt {attempt+1}/3). "
                             f"Waiting {wait_time:.1f}s..."
                         )
                     time.sleep(wait_time)
                     delay *= 2
                 else:
-                    if status_text is not None:
-                        status_text.warning(f"⚠️ Model **{short_name}** error: {err_msg[:120]}")
+                    if status_box is not None:
+                        status_box.warning(f"⚠️ Model **{short_name}** error: {err_msg[:120]}")
                     break
 
-        if status_text is not None:
-            status_text.info(f"➡️ Switching from **{short_name}** to next model...")
+        if status_box is not None:
+            status_box.info(f"➡️ Switching from **{short_name}** to next model...")
 
     raise Exception(f"All models failed. Last error: {last_err}")
 
 
-def apply_censor(image, boxes):
-    """Apply Gaussian blur + semi-transparent black overlay to bounding boxes."""
-    if not boxes:
-        return image.convert("RGB")
+# ============== DETECTION: ROW MODE ==============
+def detect_rows(image, row_count, row_y_positions=None):
+    """Generate boxes based on user-specified comment rows."""
+    w, h = image.size
+    boxes = []
 
-    img = image.convert("RGBA")
-    width, height = img.size
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+    if row_y_positions and len(row_y_positions) == row_count:
+        y_centers = [int(y) for y in row_y_positions]
+    else:
+        # Evenly distribute rows with top margin
+        margin = int(h * 0.10)
+        usable_h = h - 2 * margin
+        step = usable_h / max(row_count, 1)
+        y_centers = [int(margin + step * (i + 0.5)) for i in range(row_count)]
 
-    for box in boxes:
-        try:
-            x1, y1, x2, y2 = map(int, box.get("bbox", [0, 0, 0, 0]))
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(width, x2), min(height, y2)
+    # Avatar size proportional to image height (~4%)
+    avatar_r = int(h * 0.038)
+    avatar_r = max(18, min(avatar_r, 32))
 
-            if x2 > x1 and y2 > y1:
-                # Blur region
-                region = img.crop((x1, y1, x2, y2))
-                blurred = region.filter(ImageFilter.GaussianBlur(radius=18))
-                img.paste(blurred, (x1, y1))
-                # Dark overlay for extra opacity
-                draw.rectangle([x1, y1, x2, y2], fill=(0, 0, 0, 110))
-        except Exception:
-            continue
+    for y in y_centers:
+        # Profile pic: circle on far left
+        boxes.append({
+            "type": "profile_pic",
+            "bbox": [2, y - avatar_r, 2 + avatar_r * 2, y + avatar_r]
+        })
+        # Name: rectangle to the right of avatar
+        boxes.append({
+            "type": "name",
+            "bbox": [
+                2 + avatar_r * 2 + 4,
+                y - avatar_r - 2,
+                min(w, 2 + avatar_r * 2 + 300),
+                y + avatar_r + 6
+            ]
+        })
 
-    return Image.alpha_composite(img, overlay).convert("RGB")
-
-
-def process_batch(images, status_container, progress_bar):
-    """Process a list of uploaded files and return [(filename, bytes)]."""
-    results = []
-    total = len(images)
-
-    for i, uploaded_file in enumerate(images):
-        status_container.info(f"🔍 [{i+1}/{total}] Detecting: **{uploaded_file.name}**")
-
-        uploaded_file.seek(0)
-        image = Image.open(uploaded_file).convert("RGB")
-
-        # AI detection
-        boxes = detect_regions(image, status_container)
-        detected_count = len([b for b in boxes if b.get("type") in ("profile_pic", "name")])
-
-        status_container.info(
-            f"🛡️ [{i+1}/{total}] Censoring: **{uploaded_file.name}** — {detected_count} region(s) found"
-        )
-
-        # Apply censor
-        censored = apply_censor(image, boxes)
-
-        # Export to bytes (keep original filename exactly)
-        buf = io.BytesIO()
-        censored.save(buf, format="PNG")
-        buf.seek(0)
-
-        results.append((uploaded_file.name, buf.getvalue()))
-        progress_bar.progress((i + 1) / total)
-
-        # Small delay to avoid rate limits between images
-        if i < total - 1:
-            time.sleep(2)
-
-    return results
+    return boxes
 
 
-def build_zip(processed_images):
-    """Build an in-memory ZIP archive preserving original filenames."""
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for filename, data in processed_images:
+# ============== ZIP BUILDER ==============
+def build_zip(processed):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for filename, data in processed:
             zf.writestr(filename, data)
-    zip_buffer.seek(0)
-    return zip_buffer.getvalue()
+    buf.seek(0)
+    return buf.getvalue()
 
 
 # ============== UI ==============
-st.title("🛡️ Auto Censor — Facebook Screenshot")
-st.caption("Upload Facebook group screenshots → AI detects profile pics & account names → Auto blur → Download ZIP")
+st.title("🛡️ Auto Censor v2 — Facebook Screenshot")
+st.caption("Blur profile pictures & account names. Three methods: Smart CV (free/local), AI Vision (Gemini), or Row Mode (manual).")
 
-if not GEMINI_API_KEY:
-    st.error("❌ GEMINI_API_KEY not found in Streamlit secrets.")
-    st.markdown("Please create `.streamlit/secrets.toml` with:")
-    st.code('GEMINI_API_KEY = "your-api-key-here"', language="toml")
+# Sidebar
+with st.sidebar:
+    st.header("⚙️ Settings")
+
+    method = st.radio(
+        "Detection Method",
+        options=["Smart CV (Free, Local)", "AI Vision (Gemini)", "Row Mode (Manual)"],
+        index=0,
+        help=(
+            "Smart CV: Uses OpenCV to detect circular avatars + names. Completely free, no API.\n\n"
+            "AI Vision: Uses Gemini for detection. Free tier (1,500 req/day).\n\n"
+            "Row Mode: You define comment rows manually. Most reliable but requires setup."
+        ),
+    )
+
+    if method == "Smart CV (Free, Local)":
+        sensitivity = st.slider("Sensitivity", 0.5, 1.5, 1.0, 0.1,
+                                help="Higher = detects more (may include false positives). Lower = stricter.")
+        name_width = st.slider("Name box width (px)", 150, 400, 280, 10,
+                               help="Width of the blur area to the right of each avatar.")
+        st.success("✅ No API calls. Runs entirely on your machine.")
+
+    elif method == "AI Vision (Gemini)":
+        default_key = ""
+        try:
+            default_key = st.secrets.get("GEMINI_API_KEY", "")
+        except Exception:
+            pass
+        gemini_key = st.text_input("Gemini API Key", type="password", value=default_key)
+        st.info("💡 Uses Gemini Flash free tier (1,500 requests/day).")
+
+    else:  # Row Mode
+        st.info("📏 Define comment rows. Best for screenshots where auto-detection fails.")
+
+    show_overlay = st.checkbox("Show detection overlay in preview", value=True)
+
+    st.divider()
+    st.markdown("""
+    **Overlay Legend:**
+    - 🔴 **Red** = Profile Picture
+    - 🔵 **Blue** = Name / Username
+    """)
+
+# Main upload area
+st.divider()
+st.subheader("📷 Upload Images")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.markdown("**Main Images** (post + top comments)")
+    main_files = st.file_uploader(
+        "Upload main screenshots",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        key="main",
+        label_visibility="collapsed",
+    )
+
+with col2:
+    st.markdown("**Comment Images** (deep comment threads)")
+    comment_files = st.file_uploader(
+        "Upload comment screenshots",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        key="comment",
+        label_visibility="collapsed",
+    )
+
+# Combine for processing
+all_files = []
+if main_files:
+    all_files.extend([("main", f) for f in main_files])
+if comment_files:
+    all_files.extend([("comment", f) for f in comment_files])
+
+if not all_files:
+    st.info("👆 Upload images above to get started.")
     st.stop()
 
-# Session state for download persistence
-if "main_zip" not in st.session_state:
-    st.session_state.main_zip = None
-if "comment_zip" not in st.session_state:
-    st.session_state.comment_zip = None
-if "preview_main" not in st.session_state:
-    st.session_state.preview_main = None
+# Row Mode extra inputs
+row_mode_data = None
+if method == "Row Mode (Manual)":
+    st.divider()
+    st.subheader("📏 Row Mode Setup")
+    st.write("Specify how many comment rows are in your images. This applies to ALL uploaded images.")
 
-st.divider()
+    row_count = st.number_input("Number of comment rows per image", min_value=1, max_value=50, value=3)
+    use_custom_y = st.checkbox("Set custom Y positions (comma-separated)", value=False)
 
-# ---- MAIN IMAGES ----
-st.subheader("📷 Main Images")
-main_files = st.file_uploader(
-    "Upload main post screenshots (post + top comments)",
-    type=["png", "jpg", "jpeg"],
-    accept_multiple_files=True,
-    key="main_uploader",
-)
-
-if main_files:
-    c1, c2 = st.columns([1, 1])
-    run_main = c1.button("🚀 Censor Main Images", type="primary", key="btn_main")
-    clear_main = c2.button("🗑️ Clear", key="clr_main")
-
-    if clear_main:
-        st.session_state.main_zip = None
-        st.session_state.preview_main = None
-        st.rerun()
-
-    if run_main:
-        status = st.empty()
-        progress = st.progress(0)
-
-        with st.spinner("Processing main images with AI..."):
+    if use_custom_y:
+        y_input = st.text_input("Y positions (e.g., 120, 200, 280)", value="")
+        if y_input.strip():
             try:
-                processed = process_batch(main_files, status, progress)
-                st.session_state.main_zip = build_zip(processed)
+                row_mode_data = [int(y.strip()) for y in y_input.split(",")]
+                if len(row_mode_data) != row_count:
+                    st.warning(f"You specified {row_count} rows but provided {len(row_mode_data)} Y positions. Using evenly-spaced fallback.")
+                    row_mode_data = None
+            except ValueError:
+                st.error("Invalid Y positions. Use numbers separated by commas.")
+                st.stop()
+        else:
+            row_mode_data = None
+    else:
+        row_mode_data = None
 
-                # Save first image for preview
-                first_name, first_data = processed[0]
-                st.session_state.preview_main = first_data
+# Process button
+st.divider()
+process_btn = st.button("🚀 Process & Censor All Images", type="primary", use_container_width=True)
 
-                st.success(f"✅ {len(processed)} main image(s) censored!")
-            except Exception as e:
-                st.error(f"❌ Error: {e}")
-                st.session_state.main_zip = None
+if process_btn:
+    # Validation
+    if method == "AI Vision (Gemini)" and not gemini_key:
+        st.error("❌ Please enter your Gemini API Key in the sidebar.")
+        st.stop()
 
-    if st.session_state.preview_main:
-        st.image(st.session_state.preview_main, caption="Preview: first censored main image", use_container_width=True)
+    status = st.empty()
+    progress = st.progress(0)
 
-    if st.session_state.main_zip:
-        st.download_button(
-            label="📥 Download main.zip",
-            data=st.session_state.main_zip,
-            file_name="main.zip",
-            mime="application/zip",
-            key="dl_main",
+    main_results = []
+    comment_results = []
+    total = len(all_files)
+
+    for i, (batch_type, uploaded_file) in enumerate(all_files):
+        status.info(f"🔍 [{i+1}/{total}] Processing **{uploaded_file.name}**...")
+
+        try:
+            uploaded_file.seek(0)
+            image = Image.open(uploaded_file).convert("RGB")
+
+            # Detect based on chosen method
+            if method == "Smart CV (Free, Local)":
+                boxes = detect_opencv(image, sensitivity, name_width)
+            elif method == "AI Vision (Gemini)":
+                boxes = detect_gemini(image, gemini_key, status)
+            else:
+                boxes = detect_rows(image, row_count, row_mode_data)
+
+            # Apply censor
+            censored = apply_censor(image, boxes)
+
+            # Export to bytes
+            buf = io.BytesIO()
+            censored.save(buf, format="PNG")
+            buf.seek(0)
+
+            item = {
+                "filename": uploaded_file.name,
+                "original": image,
+                "censored": censored,
+                "overlay": draw_overlay(image, boxes) if show_overlay else None,
+                "boxes": boxes,
+                "bytes": buf.getvalue(),
+            }
+
+            if batch_type == "main":
+                main_results.append(item)
+            else:
+                comment_results.append(item)
+
+            # Rate limit spacing for Gemini
+            if method == "AI Vision (Gemini)" and i < total - 1:
+                time.sleep(1.5)
+
+        except Exception as e:
+            st.error(f"❌ Failed on **{uploaded_file.name}**: {e}")
+
+        progress.progress((i + 1) / total)
+
+    status.empty()
+    progress.empty()
+
+    # Display results
+    if main_results or comment_results:
+        st.divider()
+        st.subheader("📋 Results Preview")
+
+        all_results = main_results + comment_results
+        total_regions = sum(len(r["boxes"]) for r in all_results)
+        st.success(
+            f"✅ Processed {len(main_results)} main + {len(comment_results)} comment images. "
+            f"**{total_regions}** region(s) censored."
         )
 
-st.divider()
+        # Per-image preview
+        for item in all_results:
+            with st.container(border=True):
+                st.markdown(f"**{item['filename']}** — `{len(item['boxes'])}` region(s) detected")
 
-# ---- COMMENT IMAGES ----
-st.subheader("💬 Comment Images")
-comment_files = st.file_uploader(
-    "Upload comment thread screenshots",
-    type=["png", "jpg", "jpeg"],
-    accept_multiple_files=True,
-    key="comment_uploader",
-)
+                if len(item["boxes"]) == 0:
+                    st.warning("⚠️ No regions detected. Try increasing Sensitivity (Smart CV) or switching to Row Mode.")
 
-if comment_files:
-    c1, c2 = st.columns([1, 1])
-    run_comment = c1.button("🚀 Censor Comment Images", type="primary", key="btn_comment")
-    clear_comment = c2.button("🗑️ Clear", key="clr_comment")
+                cols = st.columns([1, 1])
 
-    if clear_comment:
-        st.session_state.comment_zip = None
-        st.rerun()
+                if show_overlay and item["overlay"] is not None:
+                    cols[0].image(item["overlay"], caption="Detection Overlay", use_container_width=True)
+                else:
+                    cols[0].image(item["original"], caption="Original", use_container_width=True)
 
-    if run_comment:
-        status = st.empty()
-        progress = st.progress(0)
+                cols[1].image(item["censored"], caption="Censored Result", use_container_width=True)
 
-        with st.spinner("Processing comment images with AI..."):
-            try:
-                processed = process_batch(comment_files, status, progress)
-                st.session_state.comment_zip = build_zip(processed)
-                st.success(f"✅ {len(processed)} comment image(s) censored!")
-            except Exception as e:
-                st.error(f"❌ Error: {e}")
-                st.session_state.comment_zip = None
+        # Download section
+        st.divider()
+        st.subheader("📥 Download")
+        dl_cols = st.columns(2)
 
-    if st.session_state.comment_zip:
-        st.download_button(
-            label="📥 Download comment.zip",
-            data=st.session_state.comment_zip,
-            file_name="comment.zip",
-            mime="application/zip",
-            key="dl_comment",
-        )
+        if main_results:
+            main_zip = build_zip([(r["filename"], r["bytes"]) for r in main_results])
+            dl_cols[0].download_button(
+                "📦 Download main.zip",
+                data=main_zip,
+                file_name="main.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
 
-st.divider()
-st.caption("💡 Filenames inside ZIP are preserved exactly as uploaded. Images are exported as PNG to maintain quality after blurring.")
+        if comment_results:
+            comment_zip = build_zip([(r["filename"], r["bytes"]) for r in comment_results])
+            dl_cols[1].download_button(
+                "📦 Download comment.zip",
+                data=comment_zip,
+                file_name="comment.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+
+        st.caption("Filenames inside ZIP are preserved exactly as uploaded. Images exported as PNG.")
