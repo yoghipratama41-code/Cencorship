@@ -69,21 +69,29 @@ def apply_censor_to_coordinates(image_pil, boxes, pad_ukuran):
     
     for box in boxes:
         if len(box) == 4:
-            # Deteksi apakah koordinatnya dinormalisasi (0-1000) atau piksel asli
-            is_normalized = all(v <= 1000 for v in box)
+            ymin, xmin, ymax, xmax = box
             
-            if is_normalized:
-                ymin, xmin, ymax, xmax = box
+            # CEK SKALA KOORDINAT:
+            # Jika semua nilai berupa angka <= 1.0, berarti skalanya pecahan desimal (0.0 - 1.0)
+            if all(v <= 1.0 for v in box):
+                left = xmin * width
+                right = xmax * width
+                top = ymin * height
+                bottom = ymax * height
+            
+            # Jika nilainya di atas 1.0 tapi di bawah 1000, berarti skala 0-1000
+            elif all(v <= 1000 for v in box):
                 left = (xmin / 1000) * width
                 right = (xmax / 1000) * width
                 top = (ymin / 1000) * height
                 bottom = (ymax / 1000) * height
+                
+            # Jika nilainya sangat besar, berarti sudah dalam bentuk piksel asli
             else:
-                ymin, xmin, ymax, xmax = box
                 left, right = xmin, xmax
                 top, bottom = ymin, ymax
 
-            # PENGAMAN: Urutkan agar kotak tidak terbalik (lebar 0 piksel)
+            # PENGAMAN: Urutkan agar koordinat kiri/kanan atau atas/bawah tidak terbalik
             x1, x2 = sorted([left, right])
             y1, y2 = sorted([top, bottom])
             
@@ -105,8 +113,8 @@ JSON harus berupa array dari objek. Setiap objek memiliki kunci 'nama' (teks nam
 
 Contoh Output:
 [
-  {"nama": "UserA", "kotak": [120, 50, 150, 200]},
-  {"nama": "UserB", "kotak": [300, 50, 330, 220]}
+  {"nama": "UserA", "kotak": [0.120, 0.050, 0.150, 0.200]},
+  {"nama": "UserB", "kotak": [0.300, 0.050, 0.330, 0.220]}
 ]
 """
 
@@ -170,7 +178,7 @@ if uploaded_files:
                 zip_file.writestr(f"censored_{filename}", img_byte_arr.getvalue())
                 
             except json.JSONDecodeError:
-                st.error(f"❌ Gagal membaca data JSON dari AI untuk {filename}. Respon AI: {response_text}")
+                st.error(f"❌ Gagal membaca data JSON dari AI untuk {filename}. Respon AI:\n\n{response_text}")
             except Exception as e:
                 st.error(f"❌ Terjadi kesalahan pada {filename}: {str(e)}")
                 
