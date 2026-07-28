@@ -136,13 +136,14 @@ def get_gemini_response(image_pil, prompt, model_names, status_box, max_retry_pe
 
 
 AIM_PROMPT = """
-Analisis gambar tangkapan layar komentar media sosial ini.
-Fokus HANYA pada NAMA PENGGUNA (username/account name) yang posisinya selalu ada di baris pertama dan dicetak TEBAL (BOLD).
-Jangan mengambil nama yang hanya disebut di dalam isi komentar (misal dibalas/mention).
-Urutkan nama sesuai urutan kemunculannya dari atas ke bawah gambar.
+Analisis gambar tangkapan layar media sosial ini (bisa berupa postingan utama, caption, ATAU komentar).
+Fokus pada SEMUA NAMA PENGGUNA (username/account name) yang dicetak TEBAL (BOLD) di mana pun posisinya di gambar ini —
+baik itu nama yang memposting konten utama, maupun nama-nama akun pada tiap komentar.
+Jangan mengambil nama yang hanya disebut/di-mention di dalam ISI teks komentar atau caption (bukan nama akun itu sendiri).
 
 Kembalikan hasilnya dalam format JSON murni, tanpa teks penjelasan, tanpa markdown.
-JSON harus berupa array of string. Contoh:
+JSON harus berupa array of string, urut dari atas ke bawah gambar. Kalau tidak ada nama akun yang terlihat, kembalikan array kosong [].
+Contoh:
 ["See Toh Kwai Leng", "Pengkok Lim", "Mat Ken"]
 """
 
@@ -244,8 +245,85 @@ def apply_censor_pixel_boxes(image_pil, boxes, pad_ukuran, offset_y):
 # 5. ALUR KERJA UI STREAMLIT
 # ==========================================
 
+# ==========================================
+# 5. FUNGSI PEMROSESAN GAMBAR (dipakai untuk Gambar Utama & Gambar Komentar)
+# ==========================================
+def process_and_censor(uploaded_file, model_fallback_list, reader, zip_file, zip_folder, match_threshold, pad_ukuran, offset_y):
+    """
+    Jalankan pipeline lengkap (Gemini -> identifikasi nama, EasyOCR -> lokasi pixel,
+    lalu sensor) untuk satu gambar, tampilkan hasilnya di UI, dan simpan ke ZIP
+    dengan nama file asli di dalam folder `zip_folder`.
+    """
+    filename = uploaded_file.name
+    response_text = ""
+    try:
+        # 1. Baca gambar
+        image = PIL.Image.open(uploaded_file).convert("RGB")
+
+        # 2. Gemini: identifikasi NAMA saja (tanpa koordinat), dengan fallback ganti model
+        status_box = st.empty()
+        with st.spinner(f"Gemini membaca nama di {filename}..."):
+            response_text, model_dipakai = get_gemini_response(
+                image, AIM_PROMPT, model_fallback_list, status_box
+            )
+        status_box.caption(f"✅ Berhasil pakai model: **{model_dipakai}**")
+
+        json_clean = response_text.replace("```json", "").replace("```", "").strip()
+        name_list = json.loads(json_clean)
+
+        # 3. EasyOCR: baca semua teks + lokasi pixel aslinya
+        with st.spinner(f"EasyOCR mencari lokasi pixel di {filename}..."):
+            ocr_results = run_ocr(image, reader)
+
+        # 4. Cocokkan tiap nama dari Gemini ke box OCR yang paling mirip
+        used_indices = set()
+        matched_boxes = []
+        unmatched_names = []
+        for name in name_list:
+            box = find_name_bbox(ocr_results, name, used_indices, threshold=match_threshold)
+            if box:
+                matched_boxes.append(box)
+            else:
+                unmatched_names.append(name)
+
+        # 5. Terapkan sensor pakai box pixel asli dari OCR
+        censored_image = apply_censor_pixel_boxes(image, matched_boxes, pad_ukuran, offset_y)
+
+        # 6. Tampilkan Hasil
+        with st.container(border=True):
+            col1, col2 = st.columns(2)
+            col1.image(image, caption=f"Asli: {filename}", use_container_width=True)
+            if name_list:
+                col2.image(censored_image, caption=f"Disensor: {len(matched_boxes)}/{len(name_list)} Nama", use_container_width=True)
+            else:
+                col2.image(censored_image, caption="Tidak ada nama yang perlu disensor", use_container_width=True)
+
+            if unmatched_names:
+                st.warning(f"⚠️ Nama berikut tidak berhasil dicocokkan ke posisi pixel, coba turunkan 'Ambang Kecocokan Nama': {unmatched_names}")
+
+            with st.expander("🛠️ Lihat Data (Nama dari Gemini & Box dari OCR)"):
+                st.json({"nama_dari_gemini": name_list, "box_pixel_terpakai": matched_boxes})
+
+        # 7. Simpan ke ZIP dengan NAMA FILE ASLI (tanpa prefix)
+        img_byte_arr = io.BytesIO()
+        censored_image.save(img_byte_arr, format='PNG')
+        zip_file.writestr(f"{zip_folder}/{filename}", img_byte_arr.getvalue())
+        return True
+
+    except json.JSONDecodeError:
+        st.error(f"❌ Gagal membaca data JSON dari Gemini untuk {filename}. Respon AI:\n\n{response_text}")
+        return False
+    except Exception as e:
+        st.error(f"❌ Terjadi kesalahan pada {filename}: {str(e)}")
+        return False
+
+
+# ==========================================
+# 6. ALUR KERJA UI STREAMLIT
+# ==========================================
+
 uploaded_utama = st.file_uploader(
-    "1️⃣ Unggah Gambar Utama Postingan (opsional — TIDAK disensor, cuma ikut disimpan di ZIP)",
+    "1️⃣ Unggah Gambar Utama Postingan (ikut discan & disensor kalau ada nama akun yang kelihatan)",
     type=["png", "jpg", "jpeg"],
     accept_multiple_files=True,
     key="uploader_utama"
@@ -258,102 +336,46 @@ uploaded_komentar = st.file_uploader(
     key="uploader_komentar"
 )
 
-uploaded_files = uploaded_komentar  # dipertahankan agar sisa alur kerja di bawah tidak berubah
-
 if uploaded_utama or uploaded_komentar:
-    if uploaded_komentar and not api_key:
-        st.error("❌ Ada gambar komentar yang diupload, tapi Gemini API Key belum diisi di sidebar.")
+    if not api_key:
+        st.error("❌ Silakan masukkan Gemini API Key Anda di sidebar untuk melanjutkan.")
         st.stop()
 
-    if uploaded_komentar:
-        reader = load_ocr_reader()
-        genai.configure(api_key=api_key)
-        model_fallback_list = get_model_fallback_list()
+    reader = load_ocr_reader()
+    genai.configure(api_key=api_key)
+    model_fallback_list = get_model_fallback_list()
 
     st.divider()
     total_gambar = len(uploaded_utama) + len(uploaded_komentar)
     st.subheader(f"🔄 Memproses {total_gambar} Gambar...")
-    if uploaded_komentar:
-        st.caption(f"Urutan model fallback: {', '.join(m.split('/')[-1] for m in model_fallback_list)}")
+    st.caption(f"Urutan model fallback: {', '.join(m.split('/')[-1] for m in model_fallback_list)}")
 
     download_placeholder = st.empty()
     zip_buffer = io.BytesIO()
 
     with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+        progress_bar = st.progress(0)
+        done = 0
 
-        # ---------- 0. GAMBAR UTAMA: langsung disimpan, tanpa sensor ----------
         if uploaded_utama:
-            st.markdown("#### 1️⃣ Gambar Utama (tidak disensor)")
+            st.markdown("#### 1️⃣ Gambar Utama")
             for uploaded_file in uploaded_utama:
-                filename = uploaded_file.name
-                file_bytes = uploaded_file.getvalue()
-                st.image(file_bytes, caption=filename, width=250)
-                zip_file.writestr(f"Utama/{filename}", file_bytes)
-
-        progress_bar = st.progress(0) if uploaded_komentar else None
+                process_and_censor(
+                    uploaded_file, model_fallback_list, reader, zip_file, "Utama",
+                    match_threshold, pad_ukuran, offset_y
+                )
+                done += 1
+                progress_bar.progress(done / total_gambar)
 
         if uploaded_komentar:
-            st.markdown("#### 2️⃣ Gambar Komentar (disensor otomatis)")
-
-        for index, uploaded_file in enumerate(uploaded_komentar):
-            filename = uploaded_file.name
-            response_text = ""
-            try:
-                # 1. Baca gambar
-                image = PIL.Image.open(uploaded_file).convert("RGB")
-
-                # 2. Gemini: identifikasi NAMA saja (tanpa koordinat), dengan fallback ganti model
-                status_box = st.empty()
-                with st.spinner(f"Gemini membaca nama di {filename}..."):
-                    response_text, model_dipakai = get_gemini_response(
-                        image, AIM_PROMPT, model_fallback_list, status_box
-                    )
-                status_box.caption(f"✅ Berhasil pakai model: **{model_dipakai}**")
-
-                json_clean = response_text.replace("```json", "").replace("```", "").strip()
-                name_list = json.loads(json_clean)
-
-                # 3. EasyOCR: baca semua teks + lokasi pixel aslinya
-                with st.spinner(f"EasyOCR mencari lokasi pixel di {filename}..."):
-                    ocr_results = run_ocr(image, reader)
-
-                # 4. Cocokkan tiap nama dari Gemini ke box OCR yang paling mirip
-                used_indices = set()
-                matched_boxes = []
-                unmatched_names = []
-                for name in name_list:
-                    box = find_name_bbox(ocr_results, name, used_indices, threshold=match_threshold)
-                    if box:
-                        matched_boxes.append(box)
-                    else:
-                        unmatched_names.append(name)
-
-                # 5. Terapkan sensor pakai box pixel asli dari OCR
-                censored_image = apply_censor_pixel_boxes(image, matched_boxes, pad_ukuran, offset_y)
-
-                # 6. Tampilkan Hasil
-                with st.container(border=True):
-                    col1, col2 = st.columns(2)
-                    col1.image(image, caption=f"Asli: {filename}", use_container_width=True)
-                    col2.image(censored_image, caption=f"Disensor: {len(matched_boxes)}/{len(name_list)} Nama", use_container_width=True)
-
-                    if unmatched_names:
-                        st.warning(f"⚠️ Nama berikut tidak berhasil dicocokkan ke posisi pixel, coba turunkan 'Ambang Kecocokan Nama': {unmatched_names}")
-
-                    with st.expander("🛠️ Lihat Data (Nama dari Gemini & Box dari OCR)"):
-                        st.json({"nama_dari_gemini": name_list, "box_pixel_terpakai": matched_boxes})
-
-                # 7. Simpan ke ZIP dengan NAMA FILE ASLI (tanpa prefix)
-                img_byte_arr = io.BytesIO()
-                censored_image.save(img_byte_arr, format='PNG')
-                zip_file.writestr(f"Komentar_Disensor/{filename}", img_byte_arr.getvalue())
-
-            except json.JSONDecodeError:
-                st.error(f"❌ Gagal membaca data JSON dari Gemini untuk {filename}. Respon AI:\n\n{response_text}")
-            except Exception as e:
-                st.error(f"❌ Terjadi kesalahan pada {filename}: {str(e)}")
-
-            progress_bar.progress((index + 1) / len(uploaded_komentar))
+            st.markdown("#### 2️⃣ Gambar Komentar")
+            for uploaded_file in uploaded_komentar:
+                process_and_censor(
+                    uploaded_file, model_fallback_list, reader, zip_file, "Komentar_Disensor",
+                    match_threshold, pad_ukuran, offset_y
+                )
+                done += 1
+                progress_bar.progress(done / total_gambar)
 
         zip_buffer.seek(0)
         download_placeholder.download_button(
