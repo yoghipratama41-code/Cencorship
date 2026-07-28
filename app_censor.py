@@ -244,33 +244,58 @@ def apply_censor_pixel_boxes(image_pil, boxes, pad_ukuran, offset_y):
 # 5. ALUR KERJA UI STREAMLIT
 # ==========================================
 
-uploaded_files = st.file_uploader(
-    "Unggah tangkapan layar komentar (PNG/JPG)",
+uploaded_utama = st.file_uploader(
+    "1️⃣ Unggah Gambar Utama Postingan (opsional — TIDAK disensor, cuma ikut disimpan di ZIP)",
     type=["png", "jpg", "jpeg"],
-    accept_multiple_files=True
+    accept_multiple_files=True,
+    key="uploader_utama"
 )
 
-if uploaded_files:
-    if not api_key:
-        st.error("❌ Silakan masukkan Gemini API Key Anda di sidebar untuk melanjutkan.")
+uploaded_komentar = st.file_uploader(
+    "2️⃣ Unggah Gambar Komentar (nama akun akan disensor otomatis)",
+    type=["png", "jpg", "jpeg"],
+    accept_multiple_files=True,
+    key="uploader_komentar"
+)
+
+uploaded_files = uploaded_komentar  # dipertahankan agar sisa alur kerja di bawah tidak berubah
+
+if uploaded_utama or uploaded_komentar:
+    if uploaded_komentar and not api_key:
+        st.error("❌ Ada gambar komentar yang diupload, tapi Gemini API Key belum diisi di sidebar.")
         st.stop()
 
-    reader = load_ocr_reader()
-
-    genai.configure(api_key=api_key)
-    model_fallback_list = get_model_fallback_list()
+    if uploaded_komentar:
+        reader = load_ocr_reader()
+        genai.configure(api_key=api_key)
+        model_fallback_list = get_model_fallback_list()
 
     st.divider()
-    st.subheader(f"🔄 Memproses {len(uploaded_files)} Gambar...")
-    st.caption(f"Urutan model fallback: {', '.join(m.split('/')[-1] for m in model_fallback_list)}")
+    total_gambar = len(uploaded_utama) + len(uploaded_komentar)
+    st.subheader(f"🔄 Memproses {total_gambar} Gambar...")
+    if uploaded_komentar:
+        st.caption(f"Urutan model fallback: {', '.join(m.split('/')[-1] for m in model_fallback_list)}")
 
     download_placeholder = st.empty()
     zip_buffer = io.BytesIO()
 
     with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-        progress_bar = st.progress(0)
 
-        for index, uploaded_file in enumerate(uploaded_files):
+        # ---------- 0. GAMBAR UTAMA: langsung disimpan, tanpa sensor ----------
+        if uploaded_utama:
+            st.markdown("#### 1️⃣ Gambar Utama (tidak disensor)")
+            for uploaded_file in uploaded_utama:
+                filename = uploaded_file.name
+                file_bytes = uploaded_file.getvalue()
+                st.image(file_bytes, caption=filename, width=250)
+                zip_file.writestr(f"Utama/{filename}", file_bytes)
+
+        progress_bar = st.progress(0) if uploaded_komentar else None
+
+        if uploaded_komentar:
+            st.markdown("#### 2️⃣ Gambar Komentar (disensor otomatis)")
+
+        for index, uploaded_file in enumerate(uploaded_komentar):
             filename = uploaded_file.name
             response_text = ""
             try:
@@ -318,27 +343,27 @@ if uploaded_files:
                     with st.expander("🛠️ Lihat Data (Nama dari Gemini & Box dari OCR)"):
                         st.json({"nama_dari_gemini": name_list, "box_pixel_terpakai": matched_boxes})
 
-                # 7. Simpan ke ZIP
+                # 7. Simpan ke ZIP dengan NAMA FILE ASLI (tanpa prefix)
                 img_byte_arr = io.BytesIO()
                 censored_image.save(img_byte_arr, format='PNG')
-                zip_file.writestr(f"censored_{filename}", img_byte_arr.getvalue())
+                zip_file.writestr(f"Komentar_Disensor/{filename}", img_byte_arr.getvalue())
 
             except json.JSONDecodeError:
                 st.error(f"❌ Gagal membaca data JSON dari Gemini untuk {filename}. Respon AI:\n\n{response_text}")
             except Exception as e:
                 st.error(f"❌ Terjadi kesalahan pada {filename}: {str(e)}")
 
-            progress_bar.progress((index + 1) / len(uploaded_files))
+            progress_bar.progress((index + 1) / len(uploaded_komentar))
 
         zip_buffer.seek(0)
         download_placeholder.download_button(
-            label="📦 Unduh Semua Gambar Disensor (.zip)",
+            label="📦 Unduh Semua Gambar (.zip)",
             data=zip_buffer,
-            file_name="semua_gambar_disensor.zip",
+            file_name="hasil_gns_censor.zip",
             mime="application/zip",
             use_container_width=True
         )
         st.success("✅ Semua gambar selesai diproses. Kalau ada nama yang tidak tersensor, cek peringatan di atas dan coba turunkan Ambang Kecocokan Nama.")
 
-elif not uploaded_files:
-    st.info("👆 Silakan unggah satu atau beberapa gambar untuk memulai.")
+else:
+    st.info("👆 Silakan unggah Gambar Utama dan/atau Gambar Komentar untuk memulai.")
