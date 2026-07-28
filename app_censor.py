@@ -55,8 +55,8 @@ with st.sidebar:
     st.caption("Kotak sekarang dari EasyOCR (pixel asli), jadi biasanya sudah pas. "
                "Slider ini cuma untuk fine-tune kecil kalau masih kurang pas.")
 
-    offset_y = st.slider("Geser Vertikal (Y) px:", min_value=-20, max_value=20, value=0, step=1)
-    pad_ukuran = st.slider("Lebar Ekstra (Padding px):", min_value=0, max_value=20, value=3, step=1)
+    offset_y = st.slider("Geser Vertikal (Y) px:", min_value=-20, max_value=20, value=-1, step=1)
+    pad_ukuran = st.slider("Lebar Ekstra (Padding px):", min_value=0, max_value=20, value=0, step=1)
 
     st.divider()
     match_threshold = st.slider(
@@ -341,51 +341,60 @@ if uploaded_utama or uploaded_komentar:
         st.error("❌ Silakan masukkan Gemini API Key Anda di sidebar untuk melanjutkan.")
         st.stop()
 
-    reader = load_ocr_reader()
-    genai.configure(api_key=api_key)
-    model_fallback_list = get_model_fallback_list()
-
-    st.divider()
     total_gambar = len(uploaded_utama) + len(uploaded_komentar)
-    st.subheader(f"🔄 Memproses {total_gambar} Gambar...")
-    st.caption(f"Urutan model fallback: {', '.join(m.split('/')[-1] for m in model_fallback_list)}")
+    st.divider()
+    mulai = st.button(f"🚀 Mulai Proses & Sensor ({total_gambar} gambar)", use_container_width=True, type="primary")
 
-    download_placeholder = st.empty()
-    zip_buffer = io.BytesIO()
+    # Hanya jalankan pipeline Gemini/OCR kalau tombol ini benar-benar diklik.
+    # Hasilnya disimpan di session_state, supaya klik tombol download di bawah
+    # TIDAK memicu proses ulang (dan tidak makan kuota API lagi).
+    if mulai:
+        reader = load_ocr_reader()
+        genai.configure(api_key=api_key)
+        model_fallback_list = get_model_fallback_list()
 
-    with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-        progress_bar = st.progress(0)
-        done = 0
+        st.subheader(f"🔄 Memproses {total_gambar} Gambar...")
+        st.caption(f"Urutan model fallback: {', '.join(m.split('/')[-1] for m in model_fallback_list)}")
 
-        if uploaded_utama:
-            st.markdown("#### 1️⃣ Gambar Utama")
-            for uploaded_file in uploaded_utama:
-                process_and_censor(
-                    uploaded_file, model_fallback_list, reader, zip_file, "Utama",
-                    match_threshold, pad_ukuran, offset_y
-                )
-                done += 1
-                progress_bar.progress(done / total_gambar)
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+            progress_bar = st.progress(0)
+            done = 0
 
-        if uploaded_komentar:
-            st.markdown("#### 2️⃣ Gambar Komentar")
-            for uploaded_file in uploaded_komentar:
-                process_and_censor(
-                    uploaded_file, model_fallback_list, reader, zip_file, "Komentar_Disensor",
-                    match_threshold, pad_ukuran, offset_y
-                )
-                done += 1
-                progress_bar.progress(done / total_gambar)
+            if uploaded_utama:
+                st.markdown("#### 1️⃣ Gambar Utama")
+                for uploaded_file in uploaded_utama:
+                    process_and_censor(
+                        uploaded_file, model_fallback_list, reader, zip_file, "Utama",
+                        match_threshold, pad_ukuran, offset_y
+                    )
+                    done += 1
+                    progress_bar.progress(done / total_gambar)
+
+            if uploaded_komentar:
+                st.markdown("#### 2️⃣ Gambar Komentar")
+                for uploaded_file in uploaded_komentar:
+                    process_and_censor(
+                        uploaded_file, model_fallback_list, reader, zip_file, "Komentar_Disensor",
+                        match_threshold, pad_ukuran, offset_y
+                    )
+                    done += 1
+                    progress_bar.progress(done / total_gambar)
 
         zip_buffer.seek(0)
-        download_placeholder.download_button(
-            label="📦 Unduh Semua Gambar (.zip)",
-            data=zip_buffer,
+        st.session_state["zip_hasil"] = zip_buffer.getvalue()
+        st.session_state["zip_jumlah"] = total_gambar
+        st.success("✅ Semua gambar selesai diproses. Kalau ada nama yang tidak tersensor, cek peringatan di atas dan coba turunkan Ambang Kecocokan Nama.")
+
+    # Tombol download ini membaca dari session_state, bukan menjalankan proses lagi.
+    if "zip_hasil" in st.session_state:
+        st.download_button(
+            label=f"📦 Unduh Hasil ({st.session_state['zip_jumlah']} gambar, .zip)",
+            data=st.session_state["zip_hasil"],
             file_name="hasil_gns_censor.zip",
             mime="application/zip",
             use_container_width=True
         )
-        st.success("✅ Semua gambar selesai diproses. Kalau ada nama yang tidak tersensor, cek peringatan di atas dan coba turunkan Ambang Kecocokan Nama.")
 
 else:
     st.info("👆 Silakan unggah Gambar Utama dan/atau Gambar Komentar untuk memulai.")
